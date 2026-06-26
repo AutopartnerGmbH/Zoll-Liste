@@ -349,7 +349,24 @@ tr:hover .row-actions{opacity:1}
 .toast{position:fixed;bottom:20px;right:20px;background:var(--text);color:#fff;padding:10px 16px;border-radius:8px;font-size:13px;font-weight:500;z-index:400;transform:translateY(20px);opacity:0;transition:all .25s;pointer-events:none;max-width:320px}
 .toast.show{transform:translateY(0);opacity:1}
 .toast.success{background:var(--green)}.toast.error{background:var(--red)}.toast.warning{background:#92400E}
-/* ── Duplicate highlight ── */
+/* ── Column filters ── */
+.col-filter{position:relative;display:inline-flex;align-items:center;gap:4px;cursor:pointer;user-select:none;white-space:nowrap}
+.col-filter-btn{background:none;border:none;cursor:pointer;font-size:10px;color:var(--muted);padding:1px 3px;border-radius:3px;line-height:1}
+.col-filter-btn:hover,.col-filter-btn.active{background:var(--accent-bg);color:var(--accent)}
+.col-filter-btn.active{color:var(--accent);font-weight:700}
+.col-filter-dropdown{position:absolute;top:100%;left:0;z-index:150;background:var(--surface);border:1px solid var(--border);border-radius:8px;box-shadow:0 4px 20px rgba(0,0,0,.15);min-width:200px;max-height:280px;display:none;flex-direction:column}
+.col-filter-dropdown.open{display:flex}
+.col-filter-search{padding:8px 10px;border:none;border-bottom:1px solid var(--border);font-size:12px;outline:none;background:var(--surface2);border-radius:8px 8px 0 0;width:100%}
+.col-filter-options{overflow-y:auto;flex:1}
+.col-filter-option{display:flex;align-items:center;gap:8px;padding:6px 10px;font-size:12px;cursor:pointer}
+.col-filter-option:hover{background:var(--accent-bg)}
+.col-filter-option input[type=checkbox]{cursor:pointer;accent-color:var(--accent)}
+.col-filter-footer{padding:6px 10px;border-top:1px solid var(--border);display:flex;gap:6px}
+.col-filter-footer button{flex:1;padding:5px;font-size:11px;font-weight:600;border:none;border-radius:4px;cursor:pointer}
+.cf-apply{background:var(--accent);color:#fff}
+.cf-clear{background:var(--bg);color:var(--text);border:1px solid var(--border) !important}
+/* Active filter indicator on th */
+th.filtered{background:#EEF2FF}
 tr.duplicate-row td{background:#FEF2F2 !important;border-left:3px solid var(--red)}
 tr.duplicate-row:hover td{background:#fde8e8 !important}
 /* Duplicate alert banner */
@@ -434,16 +451,10 @@ tr.duplicate-row:hover td{background:#fde8e8 !important}
   <div class="toolbar">
     <div class="search-wrap">
       <span class="search-icon">🔍</span>
-      <input type="text" id="searchInput" placeholder="Suchen…" oninput="renderTable()" />
+      <input type="text" id="searchInput" placeholder="Alles durchsuchen…" oninput="renderTable()" />
     </div>
-    <select class="filter-select" id="filterStatus" onchange="renderTable()">
-      <option value="">Alle Status</option>
-      <option value="verzollt">Verzollt</option>
-      <option value="offen">Noch offen</option>
-    </select>
-    <select class="filter-select" id="filterVendor" onchange="renderTable()">
-      <option value="">Alle Verkäufer</option>
-    </select>
+    <button class="btn btn-sm btn-outline" onclick="clearAllFilters()">✕ Filter zurücksetzen</button>
+    <span id="filterCount" style="font-size:12px;color:var(--muted)"></span>
     <button class="btn btn-sm btn-danger" onclick="clearAllData()" style="margin-left:auto">🗑 Alle löschen</button>
   </div>
 
@@ -453,14 +464,15 @@ tr.duplicate-row:hover td{background:#fde8e8 !important}
       <table>
         <thead>
           <tr>
-            <th>Verkäufer</th>
-            <th>Order-Nr.</th>
-            <th>Datum</th>
+            <th><div class="col-filter">Verkäufer <button class="col-filter-btn" id="cfBtn_verkaeufer" onclick="toggleColFilter(event,'verkaeufer')">▾</button><div class="col-filter-dropdown" id="cfDrop_verkaeufer"></div></div></th>
+            <th><div class="col-filter">Order-Nr. <button class="col-filter-btn" id="cfBtn_ordernr" onclick="toggleColFilter(event,'ordernr')">▾</button><div class="col-filter-dropdown" id="cfDrop_ordernr"></div></div></th>
+            <th><div class="col-filter">Datum <button class="col-filter-btn" id="cfBtn_datum" onclick="toggleColFilter(event,'datum')">▾</button><div class="col-filter-dropdown" id="cfDrop_datum"></div></div></th>
             <th>Preis USD</th>
-            <th>Versand USA</th>
-            <th>Tracking & Transporte</th>
-            <th>Verzollt</th>
-            <th>ATC-Nummer(n)</th>
+            <th><div class="col-filter">Versand USA <button class="col-filter-btn" id="cfBtn_versand" onclick="toggleColFilter(event,'versand')">▾</button><div class="col-filter-dropdown" id="cfDrop_versand"></div></div></th>
+            <th><div class="col-filter">Transporteur <button class="col-filter-btn" id="cfBtn_transporteur" onclick="toggleColFilter(event,'transporteur')">▾</button><div class="col-filter-dropdown" id="cfDrop_transporteur"></div></div></th>
+            <th>Tracking</th>
+            <th><div class="col-filter">Verzollt <button class="col-filter-btn" id="cfBtn_verzollt" onclick="toggleColFilter(event,'verzollt')">▾</button><div class="col-filter-dropdown" id="cfDrop_verzollt"></div></div></th>
+            <th>ATC-Nummer</th>
             <th>Belege</th>
             <th></th>
           </tr>
@@ -519,31 +531,24 @@ tr.duplicate-row:hover td{background:#fde8e8 !important}
 
       <!-- Belege -->
       <div>
-        <div class="section-divider">Belege</div>
-        <div class="form-grid" style="margin-top:10px">
-          <div class="field">
-            <label>📦 Bestellbestätigung</label>
-            <div class="beleg-upload-row">
-              <label class="beleg-label-btn"><input type="file" id="b_bestellung" accept=".pdf" onchange="handleBelegUpload('bestellung')">📎 PDF auswählen</label>
-              <span class="beleg-filename" id="bf_bestellung"></span>
-              <button class="btn btn-sm" id="bdel_bestellung" style="display:none;background:var(--red-bg);color:var(--red)" onclick="clearBeleg('bestellung')">✕</button>
-            </div>
-          </div>
-          <div class="field">
-            <label>📋 Steuerbescheid(e)</label>
-            <div class="beleg-upload-row">
-              <label class="beleg-label-btn"><input type="file" id="b_steuer" accept=".pdf" multiple onchange="handleBelegUpload('steuer')">📎 PDF auswählen</label>
-              <span class="beleg-filename" id="bf_steuer"></span>
-              <button class="btn btn-sm" id="bdel_steuer" style="display:none;background:var(--red-bg);color:var(--red)" onclick="clearBeleg('steuer')">✕</button>
-            </div>
+        <div class="section-divider">Belege — Dateipfade</div>
+        <div style="font-size:12px;color:var(--muted);margin:8px 0 10px">Trage den Windows-Pfad zur gespeicherten Datei ein. Empfohlene Struktur: <code style="background:var(--bg);padding:1px 5px;border-radius:3px">C:\Zoll\2026\[OrderNr]\</code></div>
+        <div class="form-grid">
+          <div class="field form-full">
+            <label>📦 Bestellbestätigung — Pfad</label>
+            <input type="text" id="b_bestellung" placeholder="z.B. C:\Zoll\2026\349713698\Bestellbestaetigung.pdf" />
           </div>
           <div class="field form-full">
-            <label>🚚 Frachtrechnung(en) (FedEx / DHL / UPS etc.)</label>
-            <div class="beleg-upload-row">
-              <label class="beleg-label-btn"><input type="file" id="b_rechnung" accept=".pdf" multiple onchange="handleBelegUpload('rechnung')">📎 PDF auswählen</label>
-              <span class="beleg-filename" id="bf_rechnung"></span>
-              <button class="btn btn-sm" id="bdel_rechnung" style="display:none;background:var(--red-bg);color:var(--red)" onclick="clearBeleg('rechnung')">✕</button>
-            </div>
+            <label>📋 Steuerbescheid — Pfad</label>
+            <input type="text" id="b_steuer" placeholder="z.B. C:\Zoll\2026\349713698\Steuerbescheid.pdf" />
+          </div>
+          <div class="field form-full">
+            <label>🚚 Frachtrechnung — Pfad</label>
+            <input type="text" id="b_rechnung" placeholder="z.B. C:\Zoll\2026\349713698\RE_FedEx_499680808518.pdf" />
+          </div>
+          <div class="field form-full">
+            <label>📁 Ordner-Pfad (optional — für Schnellzugriff auf alle Belege)</label>
+            <input type="text" id="b_ordner" placeholder="z.B. C:\Zoll\2026\349713698\" />
           </div>
         </div>
       </div>
@@ -598,15 +603,20 @@ tr.duplicate-row:hover td{background:#fde8e8 !important}
   </div>
 </div>
 
-<!-- Beleg View Modal -->
+<!-- Beleg Path Modal -->
 <div class="modal-overlay" id="belegModal">
-  <div class="modal" style="max-width:800px">
+  <div class="modal" style="max-width:520px">
     <div class="modal-header">
-      <div class="modal-title" id="belegModalTitle">Beleg</div>
+      <div class="modal-title" id="belegModalTitle">Beleg öffnen</div>
       <button class="close-btn" onclick="closeModal('belegModal')">×</button>
     </div>
-    <div class="modal-body" style="padding:0">
-      <iframe id="belegFrame" style="width:100%;height:70vh;border:none"></iframe>
+    <div class="modal-body" style="gap:12px">
+      <div style="font-size:13px;color:var(--muted)">Gespeicherter Dateipfad:</div>
+      <div id="belegPathDisplay" style="font-family:var(--mono);font-size:13px;background:var(--bg);padding:10px 12px;border-radius:6px;border:1px solid var(--border);word-break:break-all"></div>
+      <div style="font-size:12px;color:var(--muted);background:var(--accent-bg);padding:10px 12px;border-radius:6px;border:1px solid #C5D8F0">
+        💡 <strong>So öffnen:</strong> Pfad oben kopieren → Windows-Explorer öffnen → in die Adressleiste einfügen → Enter
+      </div>
+      <button class="btn btn-primary" onclick="copyBelegPath()" style="width:100%">📋 Pfad kopieren</button>
     </div>
   </div>
 </div>
@@ -632,7 +642,7 @@ tr.duplicate-row:hover td{background:#fde8e8 !important}
 // ════════════════════════════════════════════════
 let orders = [];
 let editingId = null;
-let tempBelegs = {}; // {bestellung: {name, data}, steuer: [...], rechnung: [...]}
+let currentBelegPathTemp = null; // unused, kept for compatibility
 let trackEntryCount = 0;
 let logEntries = [];
 let backupDoneToday = false;
@@ -675,24 +685,115 @@ async function handleFiles(files) {
   const key = getKey();
   if (!key) { showToast('Bitte zuerst API-Key eingeben', 'error'); return; }
   setProcessing(true, `${files.length} Dokument(e) werden ausgelesen…`);
+  const saveQueue = []; // PDFs that can be saved with suggested names
   for (const f of files) {
-    try { await processFile(f, key); }
+    try {
+      const result = await processFile(f, key);
+      if (result && result.suggestedName && f.type === 'application/pdf') {
+        saveQueue.push({ file: f, suggestedName: result.suggestedName, orderId: result.orderId, belegType: result.belegType });
+      }
+    }
     catch(e) { addLog('error', 'Fehler: ' + f.name, [e.message]); showToast('Fehler: ' + e.message, 'error'); }
   }
   setProcessing(false);
   renderTable(); updateStats();
   document.getElementById('fileInput').value = '';
+  // Show save buttons for PDFs
+  if (saveQueue.length) showSaveQueue(saveQueue);
+}
+
+// ── Save Queue UI ──────────────────────────────
+let pendingSaves = [];
+
+function showSaveQueue(queue) {
+  pendingSaves = queue;
+  const existing = document.getElementById('saveQueueBar');
+  if (existing) existing.remove();
+
+  const bar = document.createElement('div');
+  bar.id = 'saveQueueBar';
+  bar.style.cssText = 'background:#fff;border:1px solid #D1FAE5;border-radius:10px;padding:14px 18px;display:grid;gap:8px;';
+
+  const title = document.createElement('div');
+  title.style.cssText = 'font-size:12px;font-weight:700;text-transform:uppercase;letter-spacing:.5px;color:#065F46;margin-bottom:2px';
+  title.textContent = '💾 PDFs speichern — vorgeschlagene Dateinamen';
+  bar.appendChild(title);
+
+  queue.forEach((item, i) => {
+    const row = document.createElement('div');
+    row.style.cssText = 'display:flex;align-items:center;gap:8px;flex-wrap:wrap';
+    row.innerHTML = `
+      <span style="font-size:12px;color:var(--muted);min-width:90px">${item.belegType==='bestellung'?'📦 Bestellung':item.belegType==='steuer'?'📋 Steuerbescheid':item.belegType==='rechnung'?'🚚 Frachtrechnung':'📄 Dokument'}</span>
+      <input id="sqName_${i}" value="${escH(item.suggestedName)}" style="flex:1;min-width:200px;padding:6px 10px;border:1px solid var(--border);border-radius:5px;font-family:var(--mono);font-size:12px;background:var(--bg)" />
+      <button onclick="savePdfFromQueue(${i})" style="padding:6px 12px;background:#059669;color:#fff;border:none;border-radius:5px;font-size:12px;font-weight:600;cursor:pointer">↓ Speichern</button>
+    `;
+    bar.appendChild(row);
+  });
+
+  const closeBtn = document.createElement('button');
+  closeBtn.textContent = '✕ Schließen';
+  closeBtn.style.cssText = 'align-self:flex-end;background:none;border:none;font-size:12px;color:var(--muted);cursor:pointer;padding:2px 6px';
+  closeBtn.onclick = () => bar.remove();
+  bar.appendChild(closeBtn);
+
+  // Insert after processingBar
+  const anchor = document.getElementById('matchLog');
+  anchor.parentNode.insertBefore(bar, anchor);
+}
+
+function savePdfFromQueue(i) {
+  const item = pendingSaves[i];
+  if (!item) return;
+  const nameInput = document.getElementById('sqName_'+i);
+  const name = (nameInput ? nameInput.value.trim() : item.suggestedName) || item.suggestedName;
+  // Download the file with the suggested name
+  const url = URL.createObjectURL(item.file);
+  const a = document.createElement('a'); a.href = url; a.download = name; a.click();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+  showToast(`↓ ${name} wird gespeichert`, 'success');
+  // Disable button
+  const btn = document.querySelector(`#saveQueueBar button[onclick="savePdfFromQueue(${i})"]`);
+  if (btn) { btn.textContent = '✓ Gespeichert'; btn.style.background = '#6B7280'; btn.disabled = true; }
+}
+
+// ── Suggest filename based on extracted data ──
+function suggestFilename(data, originalName) {
+  const docType = data.dokument_typ || 'unbekannt';
+  const vendor = (data.verkaeufer || '').replace(/[^a-zA-Z0-9]/g,'');
+  const orderNr = data.order_nummer || '';
+  const date = (data.datum || '').replace(/\./g,'-');
+  const atcs = (data.atc_nummern||[]);
+  const rechnungen = (data.rechnungsnummern||[]);
+  const transporte = (data.transporte||[]);
+
+  let name = '';
+  if (docType === 'bestellung') {
+    name = `Bestellbestaetigung_${vendor}_${orderNr}${date?'_'+date:''}.pdf`;
+  } else if (docType === 'steuerbescheid') {
+    const atc = atcs[0] ? atcs[0].replace(/[\/\\:*?"<>|]/g,'-') : '';
+    name = `Steuerbescheid_${atc||orderNr||date}.pdf`;
+  } else if (docType === 'rechnung') {
+    const re = rechnungen[0] ? rechnungen[0].replace(/[\/\\:*?"<>| ]/g,'_') : '';
+    const carrier = transporte[0]?.transporteur || '';
+    name = `${re||('RE_'+carrier+'_'+orderNr)}.pdf`;
+  } else if (docType === 'versand') {
+    name = `Versandbestaetigung_${vendor}_${orderNr}.pdf`;
+  } else {
+    name = originalName; // keep original if unknown
+  }
+  return name.replace(/^_|_$/g,'').replace(/__+/g,'_');
 }
 
 async function processFile(file, key) {
   let messages;
+  let fileB64 = null;
   if (file.type === 'application/pdf' || file.name.endsWith('.pdf')) {
     const ab = await file.arrayBuffer();
     const bytes = new Uint8Array(ab);
     let bin = ''; for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
-    const b64 = btoa(bin);
+    fileB64 = btoa(bin);
     messages = [{ role:'user', content:[
-      { type:'document', source:{ type:'base64', media_type:'application/pdf', data:b64 }},
+      { type:'document', source:{ type:'base64', media_type:'application/pdf', data:fileB64 }},
       { type:'text', text:'Extrahiere die Zolldaten aus diesem Dokument.' }
     ]}];
   } else {
@@ -708,7 +809,7 @@ Felder:
 - datum: TT.MM.JJJJ
 - preis_usd: Kaufpreis in USD als Zahl (null wenn nur EUR)
 - versand_usa: "Direkt nach DE" | "Vorerst zu Axel" | ""
-- transporte: Array von Objekten [{transporteur:"FedEx", tracking_nummern:["123","456"], tracking_urls:["https://...","https://..."]}] — pro Transportunternehmen ein Objekt. tracking_urls sind die echten href-Links aus der Email hinter der jeweiligen Trackingnummer (gleiche Reihenfolge wie tracking_nummern). Den Transportunternehmen-Namen aus der URL ableiten: fedex.com→FedEx, mydhl.express.dhl oder dhl.com→DHL Express, dhl.de→DHL, ups.com→UPS, dpd.com→DPD.
+- transporte: Array von Objekten [{transporteur:"FedEx", tracking_nummern:["123","456"], tracking_urls:["https://...","https://"]}] — pro Transportunternehmen ein Objekt. tracking_urls sind die echten href-Links aus der Email hinter der jeweiligen Trackingnummer (gleiche Reihenfolge wie tracking_nummern). Den Transportunternehmen-Namen aus der URL ableiten: fedex.com→FedEx, mydhl.express.dhl oder dhl.com→DHL Express, dhl.de→DHL, ups.com→UPS, dpd.com→DPD.
 - bereits_verzollt: "Ja" | ""
 - atc_nummern: Array von ATC/ATX-Nummern
 - ucr: UCR vollständig (z.B. "873263353010_26061905")
@@ -726,7 +827,21 @@ Wichtig: Bei Steuerbescheid UCR extrahieren — der Teil vor "_" in der UCR ist 
   const raw = result.content?.map(c=>c.text||'').join('').trim().replace(/^```json\s*/i,'').replace(/^```\s*/i,'').replace(/\s*```$/i,'').trim();
   let data;
   try { data = JSON.parse(raw); } catch { throw new Error('Antwort konnte nicht geparst werden'); }
-  mergeOrCreate(data, file.name);
+
+  const orderId = mergeOrCreate(data, file.name);
+
+  // Suggest filename for PDFs
+  let suggestedName = null;
+  let belegType = 'dokument';
+  if (file.type === 'application/pdf' || file.name.endsWith('.pdf')) {
+    suggestedName = suggestFilename(data, file.name);
+    belegType = data.dokument_typ === 'bestellung' ? 'bestellung'
+              : data.dokument_typ === 'steuerbescheid' ? 'steuer'
+              : data.dokument_typ === 'rechnung' ? 'rechnung'
+              : 'dokument';
+  }
+
+  return { suggestedName, orderId, belegType };
 }
 
 // ════════════════════════════════════════════════
@@ -827,7 +942,8 @@ function mergeOrCreate(data, filename) {
     logD.push(upd.length?'Aktualisiert: '+upd.join(', '):'Keine neuen Felder');
     addLog('success', `✅ ${existing.order_nummer||existing.verkaeufer} aktualisiert`, logD);
     showToast(`✓ ${existing.order_nummer||existing.verkaeufer} aktualisiert`, 'success');
-  } else {
+    saveData();
+    return existing.id;
     const n = { id:genId(), verkaeufer:data.verkaeufer||'', order_nummer:orderNr, datum:data.datum||'', preis_usd:data.preis_usd||'',
       versand_usa:data.versand_usa||'Direkt nach DE', transporte: [], verzollt:data.bereits_verzollt||'',
       atc:atcs.join(', '), rechnungsnummer:rechnungen.join(', '), belegs:{}, created:new Date().toISOString() };
@@ -849,6 +965,7 @@ function mergeOrCreate(data, filename) {
     }
   }
   saveData();
+  return n ? n.id : null;
 }
 
 // ════════════════════════════════════════════════
@@ -936,29 +1053,162 @@ function removeManualMark(id) {
   if (row) row.classList.remove('duplicate-row');
 }
 
+// ════════════════════════════════════════════════
+//  COLUMN FILTERS
+// ════════════════════════════════════════════════
+const colFilters = {}; // { colKey: Set of selected values }
+let openFilterCol = null;
+
+const colDefs = {
+  verkaeufer:   o => o.verkaeufer || '—',
+  ordernr:      o => o.order_nummer || '—',
+  datum:        o => o.datum || '—',
+  versand:      o => o.versand_usa || '—',
+  transporteur: o => (o.transporte||[]).map(t=>t.transporteur||'Unbekannt').join(', ') || '—',
+  verzollt:     o => o.verzollt === 'Ja' ? 'Ja' : 'Offen',
+};
+
+function getColValues(colKey) {
+  const fn = colDefs[colKey]; if(!fn) return [];
+  const vals = new Set();
+  orders.forEach(o => {
+    const v = fn(o);
+    if (v.includes(', ')) v.split(', ').forEach(x => vals.add(x.trim()));
+    else vals.add(v);
+  });
+  return [...vals].sort();
+}
+
+function toggleColFilter(e, colKey) {
+  e.stopPropagation();
+  const drop = document.getElementById('cfDrop_'+colKey);
+  if (!drop) return;
+  const isOpen = drop.classList.contains('open');
+  closeAllColFilters();
+  if (!isOpen) {
+    openFilterCol = colKey;
+    drop.classList.add('open');
+    renderColFilterDropdown(colKey, drop);
+  }
+}
+
+function closeAllColFilters() {
+  document.querySelectorAll('.col-filter-dropdown').forEach(d=>d.classList.remove('open'));
+  openFilterCol = null;
+}
+
+function renderColFilterDropdown(colKey, drop) {
+  const selected = colFilters[colKey] || new Set();
+  const allVals = getColValues(colKey);
+  drop.innerHTML = `
+    <input class="col-filter-search" placeholder="Suchen…" oninput="filterColSearch(event,'${colKey}')" />
+    <div class="col-filter-options" id="cfOpts_${colKey}">
+      ${renderColOptions(allVals, selected, colKey)}
+    </div>
+    <div class="col-filter-footer">
+      <button class="cf-clear" onclick="clearColFilter('${colKey}')">Alle</button>
+      <button class="cf-apply" onclick="applyColFilter('${colKey}')">Anwenden</button>
+    </div>`;
+}
+
+function renderColOptions(vals, selected, colKey) {
+  return vals.map(v => `
+    <label class="col-filter-option">
+      <input type="checkbox" data-val="${escH(v)}" data-col="${colKey}" ${selected.has(v)?'checked':''} />
+      ${escH(v)}
+    </label>`).join('');
+}
+
+function filterColSearch(e, colKey) {
+  const q = e.target.value.toLowerCase();
+  const opts = document.getElementById('cfOpts_'+colKey);
+  if (!opts) return;
+  const selected = colFilters[colKey] || new Set();
+  const allVals = getColValues(colKey).filter(v => v.toLowerCase().includes(q));
+  opts.innerHTML = renderColOptions(allVals, selected, colKey);
+}
+
+function applyColFilter(colKey) {
+  const checks = document.querySelectorAll(`#cfOpts_${colKey} input[type=checkbox]:checked`);
+  if (checks.length === 0) {
+    delete colFilters[colKey];
+  } else {
+    colFilters[colKey] = new Set([...checks].map(c=>c.dataset.val));
+  }
+  closeAllColFilters();
+  updateFilterBtnStates();
+  renderTable();
+}
+
+function clearColFilter(colKey) {
+  delete colFilters[colKey];
+  closeAllColFilters();
+  updateFilterBtnStates();
+  renderTable();
+}
+
+function clearAllFilters() {
+  Object.keys(colFilters).forEach(k=>delete colFilters[k]);
+  document.getElementById('searchInput').value = '';
+  updateFilterBtnStates();
+  renderTable();
+}
+
+function updateFilterBtnStates() {
+  Object.keys(colDefs).forEach(k => {
+    const btn = document.getElementById('cfBtn_'+k);
+    if (!btn) return;
+    const active = colFilters[k] && colFilters[k].size > 0;
+    btn.classList.toggle('active', active);
+    btn.textContent = active ? `▾(${colFilters[k].size})` : '▾';
+    const th = btn.closest('th');
+    if (th) th.classList.toggle('filtered', active);
+  });
+  const total = Object.values(colFilters).filter(s=>s&&s.size>0).length;
+  const fc = document.getElementById('filterCount');
+  if (fc) fc.textContent = total > 0 ? `${total} Filter aktiv` : '';
+}
+
+// Close dropdowns when clicking outside
+document.addEventListener('click', e => {
+  if (!e.target.closest('.col-filter')) closeAllColFilters();
+});
+
 function renderTable() {
   const search = document.getElementById('searchInput').value.toLowerCase();
-  const fs = document.getElementById('filterStatus').value;
-  const fv = document.getElementById('filterVendor').value;
 
   // Run duplicate check first
   const { dupIds, messages } = findDuplicates();
   showDupAlert(messages);
-  // Clear dismissed marks that are no longer duplicates
   manuallyDismissedDups.forEach(id => { if(!dupIds.has(id)) manuallyDismissedDups.delete(id); });
 
   let filtered = orders.filter(o => {
-    const text = [o.verkaeufer,o.order_nummer,o.atc,o.rechnungsnummer,(o.transporte||[]).map(t=>t.tracking_nummern?.join(' ')).join(' ')].join(' ').toLowerCase();
+    // Global search
+    const text = [o.verkaeufer,o.order_nummer,o.datum,o.atc,o.rechnungsnummer,
+      (o.transporte||[]).map(t=>[t.transporteur,...(t.tracking_nummern||[])].join(' ')).join(' ')
+    ].join(' ').toLowerCase();
     if (search && !text.includes(search)) return false;
-    if (fs==='verzollt'&&o.verzollt!=='Ja') return false;
-    if (fs==='offen'&&o.verzollt==='Ja') return false;
-    if (fv&&o.verkaeufer!==fv) return false;
+
+    // Column filters
+    for (const [colKey, selected] of Object.entries(colFilters)) {
+      if (!selected || !selected.size) continue;
+      const fn = colDefs[colKey]; if(!fn) continue;
+      const val = fn(o);
+      // Check if any selected value matches (handle comma-separated multi-values)
+      const vals = val.includes(', ') ? val.split(', ').map(v=>v.trim()) : [val];
+      if (!vals.some(v => selected.has(v))) return false;
+    }
     return true;
   });
 
   const tbody = document.getElementById('tableBody');
   if (!filtered.length) {
     tbody.innerHTML = `<tr class="empty-row"><td colspan="10">${orders.length?'Keine Ergebnisse':'Noch keine Bestellungen — Email oder PDF oben reinziehen'}</td></tr>`;
+    return;
+  }
+
+  if (!filtered.length) {
+    tbody.innerHTML = `<tr class="empty-row"><td colspan="11">${orders.length?'Keine Ergebnisse':'Noch keine Bestellungen — Email oder PDF oben reinziehen'}</td></tr>`;
     return;
   }
 
@@ -976,7 +1226,6 @@ function renderTable() {
 
     // Belege
     const belegs = o.belegs||{};
-    // Rechnungsnummern aufbereiten
     const reNrs = (o.rechnungsnummer||'').split(',').map(r=>r.trim()).filter(Boolean);
     const reHtml = reNrs.length ? reNrs.map(r=>`<div style="font-size:10px;font-family:var(--mono);color:var(--muted);padding:1px 0;white-space:nowrap">${escH(r)}</div>`).join('') : '';
 
@@ -984,6 +1233,7 @@ function renderTable() {
       <button class="beleg-btn ${belegs.bestellung?'has-file':'no-file'}" onclick="viewBeleg('${o.id}','bestellung')">📦 Bestellung</button>
       <button class="beleg-btn ${belegs.steuer?'has-file':'no-file'}" onclick="viewBeleg('${o.id}','steuer')">📋 Steuerbescheid</button>
       <button class="beleg-btn ${belegs.rechnung?'has-file':'no-file'}" onclick="viewBeleg('${o.id}','rechnung')">🚚 Frachtrechnung</button>
+      ${belegs.ordner?`<button class="beleg-btn has-file" onclick="viewBeleg('${o.id}','ordner')" title="${escH(belegs.ordner)}">📁 Ordner</button>`:''}
       ${reHtml}
     </div>`;
 
@@ -1010,12 +1260,6 @@ function renderTable() {
       </td>
     </tr>`;
   }).join('');
-
-  // Vendor filter
-  const vendors = [...new Set(orders.map(o=>o.verkaeufer).filter(Boolean))].sort();
-  const vf = document.getElementById('filterVendor');
-  const cur = vf.value;
-  vf.innerHTML = '<option value="">Alle Verkäufer</option>' + vendors.map(v=>`<option value="${v}"${v===cur?' selected':''}>${v}</option>`).join('');
 }
 
 function updateStats() {
@@ -1031,47 +1275,52 @@ function updateStats() {
 // ════════════════════════════════════════════════
 //  BELEGE
 // ════════════════════════════════════════════════
-function handleBelegUpload(type) {
-  const input = document.getElementById('b_'+type);
-  if (!input.files?.length) return;
-  const file = input.files[0];
-  const reader = new FileReader();
-  reader.onload = e => {
-    if (!tempBelegs[type]) tempBelegs[type] = {};
-    tempBelegs[type] = { name: file.name, data: e.target.result };
-    document.getElementById('bf_'+type).textContent = file.name;
-    document.getElementById('bdel_'+type).style.display = 'inline-flex';
-  };
-  reader.readAsDataURL(file);
-}
-function clearBeleg(type) {
-  tempBelegs[type] = null;
-  document.getElementById('bf_'+type).textContent = '';
-  document.getElementById('bdel_'+type).style.display = 'none';
-  document.getElementById('b_'+type).value = '';
-}
+// ════════════════════════════════════════════════
+//  BELEGE (Pfad-basiert)
+// ════════════════════════════════════════════════
+let currentBelegPath = '';
+
 function viewBeleg(orderId, type) {
   const o = orders.find(x=>x.id===orderId);
   if (!o) return;
-  const beleg = o.belegs?.[type];
-  if (!beleg) { openEditModal(orderId); showToast('Noch kein Beleg vorhanden — hier hochladen', ''); return; }
-  document.getElementById('belegModalTitle').textContent = { bestellung:'📦 Bestellbestätigung', steuer:'📋 Steuerbescheid', rechnung:'🚚 Frachtrechnung' }[type]||'Beleg';
-  document.getElementById('belegFrame').src = beleg.data;
+  const belegs = o.belegs||{};
+  const path = belegs[type]||'';
+  if (!path) {
+    openEditModal(orderId);
+    showToast('Noch kein Pfad hinterlegt — bitte eintragen', '');
+    return;
+  }
+  currentBelegPath = path;
+  const labels = { bestellung:'📦 Bestellbestätigung', steuer:'📋 Steuerbescheid', rechnung:'🚚 Frachtrechnung', ordner:'📁 Ordner' };
+  document.getElementById('belegModalTitle').textContent = labels[type]||'Beleg';
+  document.getElementById('belegPathDisplay').textContent = path;
   document.getElementById('belegModal').classList.add('active');
+}
+
+function copyBelegPath() {
+  navigator.clipboard.writeText(currentBelegPath).then(()=>{
+    showToast('Pfad kopiert ✓', 'success');
+  }).catch(()=>{
+    const ta=document.createElement('textarea'); ta.value=currentBelegPath;
+    document.body.appendChild(ta); ta.select(); document.execCommand('copy');
+    document.body.removeChild(ta);
+    showToast('Pfad kopiert ✓', 'success');
+  });
 }
 
 // ════════════════════════════════════════════════
 //  MODAL
 // ════════════════════════════════════════════════
 function openAddModal() {
-  editingId = null; tempBelegs = {};
+  editingId = null;
   document.getElementById('modalTitle').textContent = 'Neue Bestellung';
   document.getElementById('m_verkaeufer').value=''; document.getElementById('m_ordernr').value='';
   document.getElementById('m_datum').value=''; document.getElementById('m_preis').value='';
   document.getElementById('m_versand').value='Direkt nach DE'; document.getElementById('m_verzollt').value='';
   document.getElementById('m_atc').value=''; document.getElementById('m_rechnung_nr').value='';
-  ['bestellung','steuer','rechnung'].forEach(t=>{
-    document.getElementById('bf_'+t).textContent=''; document.getElementById('bdel_'+t).style.display='none';
+  ['bestellung','steuer','rechnung','ordner'].forEach(t=>{
+    const el = document.getElementById('b_'+t);
+    if(el) el.value='';
   });
   trackEntryCount = 0; document.getElementById('trackEntries').innerHTML='';
   addTrackEntry();
@@ -1079,7 +1328,7 @@ function openAddModal() {
 }
 
 function openEditModal(id) {
-  editingId = id; tempBelegs = {};
+  editingId = id;
   const o = orders.find(x=>x.id===id); if(!o) return;
   document.getElementById('modalTitle').textContent = 'Bestellung bearbeiten';
   document.getElementById('m_verkaeufer').value=o.verkaeufer||'';
@@ -1090,12 +1339,11 @@ function openEditModal(id) {
   document.getElementById('m_verzollt').value=o.verzollt||'';
   document.getElementById('m_atc').value=o.atc||'';
   document.getElementById('m_rechnung_nr').value=o.rechnungsnummer||'';
-  // Belege
+  // Belege paths
   const belegs = o.belegs||{};
-  ['bestellung','steuer','rechnung'].forEach(t=>{
-    const b = belegs[t];
-    document.getElementById('bf_'+t).textContent = b?b.name:'';
-    document.getElementById('bdel_'+t).style.display = b?'inline-flex':'none';
+  ['bestellung','steuer','rechnung','ordner'].forEach(t=>{
+    const el = document.getElementById('b_'+t);
+    if(el) el.value = belegs[t]||'';
   });
   // Trackings
   trackEntryCount = 0; document.getElementById('trackEntries').innerHTML = '';
@@ -1140,9 +1388,12 @@ function saveModal() {
     const nrs = (document.getElementById('tn_'+i)?.value||'').split(',').map(n=>n.trim()).filter(Boolean);
     if (carrier||nrs.length) o.transporte.push({ transporteur:carrier, tracking_nummern:nrs });
   });
-  // Belegs
+  // Belegs — Pfade speichern
   if (!o.belegs) o.belegs = {};
-  ['bestellung','steuer','rechnung'].forEach(t=>{ if(tempBelegs[t]) o.belegs[t]=tempBelegs[t]; });
+  ['bestellung','steuer','rechnung','ordner'].forEach(t=>{
+    const el = document.getElementById('b_'+t);
+    if(el && el.value.trim()) o.belegs[t] = el.value.trim();
+  });
   if (!editingId) orders.unshift(o);
   saveData(); renderTable(); updateStats();
   closeModal('editModal'); showToast('Gespeichert ✓', 'success');
