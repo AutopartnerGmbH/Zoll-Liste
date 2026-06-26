@@ -1527,123 +1527,124 @@ async function importFile(input) {
 }
 
 async function importXLSX(file) {
-  // Parse xlsx manually - extract sheet XML from ZIP
-  const ab = await file.arrayBuffer();
-  const bytes = new Uint8Array(ab);
+  try {
+    const ab = await file.arrayBuffer();
+    const bytes = new Uint8Array(ab);
 
-  // Find shared strings and sheet data in the ZIP
-  function readZipFiles(bytes) {
-    const files = {};
-    let i = 0;
-    while (i < bytes.length - 4) {
-      if (bytes[i]===0x50 && bytes[i+1]===0x4B && bytes[i+2]===0x03 && bytes[i+3]===0x04) {
-        const fnLen = bytes[i+26] | (bytes[i+27]<<8);
-        const extraLen = bytes[i+28] | (bytes[i+29]<<8);
+    // ── ZIP reader ──────────────────────────────
+    async function readZip(bytes) {
+      const files = {};
+      let i = 0;
+      while (i < bytes.length - 30) {
+        if (bytes[i]!==0x50||bytes[i+1]!==0x4B||bytes[i+2]!==0x03||bytes[i+3]!==0x04) { i++; continue; }
+        const method   = bytes[i+8]  | (bytes[i+9]<<8);
         const compSize = bytes[i+18] | (bytes[i+19]<<8) | (bytes[i+20]<<16) | (bytes[i+21]<<24);
-        const fname = new TextDecoder().decode(bytes.slice(i+30, i+30+fnLen));
-        const dataStart = i+30+fnLen+extraLen;
-        const compMethod = bytes[i+8] | (bytes[i+9]<<8);
-        if (compMethod === 0) { // stored
-          files[fname] = new TextDecoder('utf-8').decode(bytes.slice(dataStart, dataStart+compSize));
-        } else {
-          // deflated - use DecompressionStream if available
+        const uncompSz = bytes[i+22] | (bytes[i+23]<<8) | (bytes[i+24]<<16) | (bytes[i+25]<<24);
+        const fnLen    = bytes[i+26] | (bytes[i+27]<<8);
+        const exLen    = bytes[i+28] | (bytes[i+29]<<8);
+        const fname    = new TextDecoder().decode(bytes.slice(i+30, i+30+fnLen));
+        const dataOff  = i+30+fnLen+exLen;
+        const chunk    = bytes.slice(dataOff, dataOff+compSize);
+        if (method === 0) {
+          files[fname] = new TextDecoder('utf-8').decode(chunk);
+        } else if (method === 8) {
+          // DEFLATE — use DecompressionStream (supported in all modern browsers)
           try {
-            const compressed = bytes.slice(dataStart, dataStart+compSize);
-            files[fname] = { compressed, raw: true };
-          } catch(e) {}
+            const ds = new DecompressionStream('deflate-raw');
+            const w = ds.writable.getWriter();
+            w.write(chunk); w.close();
+            const parts = [];
+            const r = ds.readable.getReader();
+            while (true) { const {done,value} = await r.read(); if(done)break; parts.push(value); }
+            const out = new Uint8Array(parts.reduce((s,p)=>s+p.length,0));
+            let pos=0; parts.forEach(p=>{out.set(p,pos);pos+=p.length;});
+            files[fname] = new TextDecoder('utf-8').decode(out);
+          } catch(e) {
+            // Fallback: try 'deflate' wrapper
+            try {
+              const ds2 = new DecompressionStream('deflate');
+              const w2 = ds2.writable.getWriter();
+              // Add zlib header
+              const wrapped = new Uint8Array(chunk.length+2);
+              wrapped[0]=0x78; wrapped[1]=0x9C; wrapped.set(chunk,2);
+              w2.write(wrapped); w2.close();
+              const parts2 = [];
+              const r2 = ds2.readable.getReader();
+              while(true){const{done,value}=await r2.read();if(done)break;parts2.push(value);}
+              const out2 = new Uint8Array(parts2.reduce((s,p)=>s+p.length,0));
+              let pos2=0; parts2.forEach(p=>{out2.set(p,pos2);pos2+=p.length;});
+              files[fname] = new TextDecoder('utf-8').decode(out2);
+            } catch(e2) { files[fname] = ''; }
+          }
         }
-        i = dataStart + compSize;
-      } else { i++; }
-    }
-    return files;
-  }
-
-  async function decompress(compressed) {
-    if (typeof DecompressionStream === 'undefined') return null;
-    const ds = new DecompressionStream('deflate-raw');
-    const writer = ds.writable.getWriter();
-    writer.write(compressed);
-    writer.close();
-    const chunks = [];
-    const reader = ds.readable.getReader();
-    while (true) {
-      const {done, value} = await reader.read();
-      if (done) break;
-      chunks.push(value);
-    }
-    const total = chunks.reduce((s,c)=>s+c.length,0);
-    const out = new Uint8Array(total);
-    let pos=0; chunks.forEach(c=>{out.set(c,pos);pos+=c.length;});
-    return new TextDecoder('utf-8').decode(out);
-  }
-
-  const zipFiles = readZipFiles(bytes);
-
-  // Decompress what needs it
-  for (const [k,v] of Object.entries(zipFiles)) {
-    if (v && v.raw) {
-      const text = await decompress(v.compressed);
-      zipFiles[k] = text || '';
-    }
-  }
-
-  // Find sheet XML
-  const sheetKey = Object.keys(zipFiles).find(k => k.match(/xl\/worksheets\/sheet\d/));
-  const sharedKey = Object.keys(zipFiles).find(k => k.includes('sharedStrings'));
-
-  if (!sheetKey || !zipFiles[sheetKey]) {
-    showToast('XLSX konnte nicht gelesen werden — bitte als CSV speichern', 'error');
-    return;
-  }
-
-  // Parse shared strings
-  const sharedStrings = [];
-  if (sharedKey && zipFiles[sharedKey]) {
-    const ssXml = zipFiles[sharedKey];
-    const matches = [...ssXml.matchAll(/<si>.*?<\/si>/gs)];
-    matches.forEach(m => {
-      const tMatches = [...m[0].matchAll(/<t[^>]*>([^<]*)<\/t>/g)];
-      sharedStrings.push(tMatches.map(t=>t[1]).join(''));
-    });
-  }
-
-  // Parse sheet
-  const sheetXml = zipFiles[sheetKey];
-  const rows = [];
-  const rowMatches = [...sheetXml.matchAll(/<row[^>]*>(.*?)<\/row>/gs)];
-
-  rowMatches.forEach(rm => {
-    const rowData = [];
-    const cellMatches = [...rm[1].matchAll(/<c r="([A-Z]+\d+)"([^>]*)>(.*?)<\/c>/gs)];
-    let maxCol = 0;
-    const cellMap = {};
-    cellMatches.forEach(cm => {
-      const ref = cm[1];
-      const attrs = cm[2];
-      const inner = cm[3];
-      const colLetter = ref.match(/^([A-Z]+)/)[1];
-      const colIdx = colLetter.split('').reduce((n,c)=>n*26+(c.charCodeAt(0)-64),0)-1;
-      maxCol = Math.max(maxCol, colIdx);
-      const vMatch = inner.match(/<v>([^<]*)<\/v>/);
-      const isStr = attrs.includes('t="s"');
-      const isInline = attrs.includes('t="inlineStr"');
-      let val = '';
-      if (isInline) {
-        val = (inner.match(/<t>([^<]*)<\/t>/)||[])[1]||'';
-      } else if (vMatch) {
-        val = isStr ? (sharedStrings[parseInt(vMatch[1])]||'') : vMatch[1];
+        i = dataOff + compSize;
       }
-      // Unescape XML entities
-      val = val.replace(/&amp;/g,'&').replace(/&lt;/g,'<').replace(/&gt;/g,'>').replace(/&quot;/g,'"').replace(/&apos;/g,"'");
-      cellMap[colIdx] = val;
-    });
-    const row = [];
-    for (let c=0; c<=maxCol; c++) row.push(cellMap[c]||'');
-    if (row.some(v=>v)) rows.push(row);
-  });
+      return files;
+    }
 
-  if (rows.length < 2) { showToast('Keine Daten in der Excel-Datei gefunden', 'error'); return; }
-  importRows(rows);
+    const zipFiles = await readZip(bytes);
+
+    // ── Parse shared strings ────────────────────
+    const sharedStrings = [];
+    const ssKey = Object.keys(zipFiles).find(k=>k.includes('sharedStrings'));
+    if (ssKey && zipFiles[ssKey]) {
+      const ssXml = zipFiles[ssKey];
+      // Match each <si> block
+      for (const m of ssXml.matchAll(/<si>([\s\S]*?)<\/si>/g)) {
+        const texts = [...m[1].matchAll(/<t(?:\s[^>]*)?>([^<]*)<\/t>/g)].map(t=>t[1]);
+        sharedStrings.push(texts.join('').replace(/&#10;/g,' ').replace(/&#13;/g,' '));
+      }
+    }
+
+    // ── Parse sheet XML ─────────────────────────
+    const shKey = Object.keys(zipFiles).find(k=>k.match(/xl\/worksheets\/sheet\d/));
+    if (!shKey || !zipFiles[shKey]) {
+      showToast('XLSX: Tabelle nicht gefunden — bitte als CSV speichern', 'error');
+      return;
+    }
+    const shXml = zipFiles[shKey];
+
+    function colToIdx(col) {
+      let n=0;
+      for(let i=0;i<col.length;i++) n=n*26+(col.charCodeAt(i)-64);
+      return n-1;
+    }
+
+    const rows = [];
+    for (const rowM of shXml.matchAll(/<row\b[^>]*>([\s\S]*?)<\/row>/g)) {
+      const cellMap = {};
+      let maxIdx = 0;
+      for (const cM of rowM[1].matchAll(/<c\s+r="([A-Z]+)\d+"([^>]*)>([\s\S]*?)<\/c>/g)) {
+        const colIdx = colToIdx(cM[1]);
+        maxIdx = Math.max(maxIdx, colIdx);
+        const attrs = cM[2], inner = cM[3];
+        const vM = inner.match(/<v>([^<]*)<\/v>/);
+        const tM = inner.match(/<t[^>]*>([^<]*)<\/t>/);
+        let val = '';
+        if (attrs.includes('t="s"') && vM) {
+          val = sharedStrings[parseInt(vM[1])] || '';
+        } else if (attrs.includes('t="inlineStr"') && tM) {
+          val = tM[1];
+        } else if (vM) {
+          val = vM[1];
+        }
+        val = val.replace(/&amp;/g,'&').replace(/&lt;/g,'<').replace(/&gt;/g,'>').replace(/&quot;/g,'"').replace(/&apos;/g,"'").replace(/&#10;/g,' ').replace(/&#13;/g,' ');
+        cellMap[colIdx] = val;
+      }
+      const row = Array.from({length:maxIdx+1}, (_,i)=>cellMap[i]||'');
+      if (row.some(v=>v)) rows.push(row);
+    }
+
+    if (rows.length < 2) {
+      showToast('XLSX: Keine Daten gefunden — bitte als CSV speichern', 'error');
+      return;
+    }
+    showImportMapping(rows);
+
+  } catch(err) {
+    showToast('XLSX-Fehler: ' + err.message + ' — bitte als CSV versuchen', 'error');
+    console.error('importXLSX error:', err);
+  }
 }
 
 function importCSV(text) {
