@@ -349,8 +349,18 @@ tr:hover .row-actions{opacity:1}
 .toast{position:fixed;bottom:20px;right:20px;background:var(--text);color:#fff;padding:10px 16px;border-radius:8px;font-size:13px;font-weight:500;z-index:400;transform:translateY(20px);opacity:0;transition:all .25s;pointer-events:none;max-width:320px}
 .toast.show{transform:translateY(0);opacity:1}
 .toast.success{background:var(--green)}.toast.error{background:var(--red)}.toast.warning{background:#92400E}
-/* Import hint */
-.import-hint{font-size:12px;color:var(--muted);text-align:center;margin-top:6px}
+/* ── Duplicate highlight ── */
+tr.duplicate-row td{background:#FEF2F2 !important;border-left:3px solid var(--red)}
+tr.duplicate-row:hover td{background:#fde8e8 !important}
+/* Duplicate alert banner */
+.dup-alert{background:#FEF2F2;border:1px solid #FCA5A5;border-radius:8px;padding:12px 16px;display:none;align-items:flex-start;gap:10px}
+.dup-alert.active{display:flex}
+.dup-alert-icon{font-size:18px;flex-shrink:0;margin-top:1px}
+.dup-alert-body{flex:1}
+.dup-alert-title{font-weight:700;color:var(--red);margin-bottom:4px;font-size:13px}
+.dup-alert-list{font-size:12px;color:#7F1D1D;font-family:var(--mono);line-height:1.8}
+.dup-alert-close{background:none;border:none;font-size:18px;cursor:pointer;color:#EF4444;padding:0 4px;flex-shrink:0;line-height:1}
+.dup-alert-close:hover{color:var(--red)}
 </style>
 </head>
 <body>
@@ -408,6 +418,16 @@ tr:hover .row-actions{opacity:1}
     <div class="stat-card orange"><div class="stat-num" id="statPending">0</div><div class="stat-label">Ausstehend</div></div>
     <div class="stat-card green"><div class="stat-num" id="statCleared">0</div><div class="stat-label">Verzollt</div></div>
     <div class="stat-card"><div class="stat-num" id="statUSD">$0</div><div class="stat-label">Gesamtwert USD</div></div>
+  </div>
+
+  <!-- Duplicate Alert -->
+  <div class="dup-alert" id="dupAlert">
+    <div class="dup-alert-icon">⚠️</div>
+    <div class="dup-alert-body">
+      <div class="dup-alert-title">Doppelungen gefunden!</div>
+      <div class="dup-alert-list" id="dupAlertList"></div>
+    </div>
+    <button class="dup-alert-close" onclick="closeDupAlert()" title="Meldung schließen">×</button>
   </div>
 
   <!-- Toolbar -->
@@ -533,7 +553,7 @@ tr:hover .row-actions{opacity:1}
         <div class="section-divider">Zoll</div>
         <div class="form-grid" style="margin-top:10px">
           <div class="field form-full"><label>ATC/ATX-Nummer(n) — kommagetrennt bei mehreren</label><textarea id="m_atc" placeholder="z.B. AT/X/12/044701/06/2026/7154"></textarea></div>
-          <div class="field form-full"><label>Rechnungsnummer(n) Transportunternehmen</label><textarea id="m_rechnung_nr" placeholder="z.B. RE FedEx 868960609, RE DHL 123456"></textarea></div>
+          <div class="field form-full"><label>Rechnungsnummer(n) Transportunternehmen</label><textarea id="m_rechnung_nr" placeholder="z.B. RE FedEx 868960609, RE DHL Express 123456"></textarea></div>
         </div>
       </div>
     </div>
@@ -589,6 +609,19 @@ tr:hover .row-actions{opacity:1}
       <iframe id="belegFrame" style="width:100%;height:70vh;border:none"></iframe>
     </div>
   </div>
+</div>
+
+<!-- Context Menu -->
+<div id="ctxMenu" style="position:fixed;z-index:500;background:var(--surface);border:1px solid var(--border);border-radius:8px;box-shadow:0 4px 20px rgba(0,0,0,.15);padding:4px;display:none;min-width:200px">
+  <button onclick="ctxRemoveMark()" style="display:flex;align-items:center;gap:8px;width:100%;padding:8px 12px;border:none;background:none;cursor:pointer;font-size:13px;border-radius:5px;color:var(--text)" onmouseover="this.style.background='var(--bg)'" onmouseout="this.style.background='none'">
+    <span>🚫</span> Markierung entfernen
+  </button>
+  <button onclick="openEditModal(ctxCurrentId)" style="display:flex;align-items:center;gap:8px;width:100%;padding:8px 12px;border:none;background:none;cursor:pointer;font-size:13px;border-radius:5px;color:var(--text)" onmouseover="this.style.background='var(--bg)'" onmouseout="this.style.background='none'">
+    <span>✏️</span> Bestellung bearbeiten
+  </button>
+  <button onclick="deleteOrder(ctxCurrentId)" style="display:flex;align-items:center;gap:8px;width:100%;padding:8px 12px;border:none;background:none;cursor:pointer;font-size:13px;border-radius:5px;color:var(--red)" onmouseover="this.style.background='var(--red-bg)'" onmouseout="this.style.background='none'">
+    <span>🗑</span> Bestellung löschen
+  </button>
 </div>
 
 <div class="toast" id="toast"></div>
@@ -675,11 +708,11 @@ Felder:
 - datum: TT.MM.JJJJ
 - preis_usd: Kaufpreis in USD als Zahl (null wenn nur EUR)
 - versand_usa: "Direkt nach DE" | "Vorerst zu Axel" | ""
-- transporte: Array von Objekten [{transporteur:"FedEx", tracking_nummern:["123","456"]}] — pro Transportunternehmen ein Objekt, alle Trackingnummern dieses Unternehmens im Array
+- transporte: Array von Objekten [{transporteur:"FedEx", tracking_nummern:["123","456"], tracking_urls:["https://...","https://..."]}] — pro Transportunternehmen ein Objekt. tracking_urls sind die echten href-Links aus der Email hinter der jeweiligen Trackingnummer (gleiche Reihenfolge wie tracking_nummern). Den Transportunternehmen-Namen aus der URL ableiten: fedex.com→FedEx, mydhl.express.dhl oder dhl.com→DHL Express, dhl.de→DHL, ups.com→UPS, dpd.com→DPD.
 - bereits_verzollt: "Ja" | ""
 - atc_nummern: Array von ATC/ATX-Nummern
 - ucr: UCR vollständig (z.B. "873263353010_26061905")
-- rechnungsnummern: Array von Rechnungsnummern des Transporteurs
+- rechnungsnummern: Array von Rechnungsnummern des Transporteurs im Format "RE FedEx XXXXXXX" oder "RE DHL Express XXXXXXX" oder "RE UPS XXXXXXX" — also immer "RE" + Transportunternehmen + Rechnungsnummer. Wenn der Transportunternehmen nicht klar ist, einfach "RE XXXXXXX".
 - dokument_typ: "bestellung"|"versand"|"steuerbescheid"|"rechnung"|"unbekannt"
 Wichtig: Bei Steuerbescheid UCR extrahieren — der Teil vor "_" in der UCR ist meist die Trackingnummer.`;
 
@@ -719,7 +752,15 @@ function mergeOrCreate(data, filename) {
   // Build flat tracking list from transporte array
   const transporte = (data.transporte || []).filter(t=>t.transporteur||t.tracking_nummern?.length);
   let allTrackings = [];
-  transporte.forEach(t => { (t.tracking_nummern||[]).forEach(tr=>{ if(tr) allTrackings.push({carrier:t.transporteur||'',nr:tr.toString().trim()}); }); });
+  transporte.forEach(t => {
+    (t.tracking_nummern||[]).forEach((tr,i)=>{
+      if(tr) allTrackings.push({
+        carrier: t.transporteur||'',
+        nr: tr.toString().trim(),
+        url: (t.tracking_urls||[])[i]||''
+      });
+    });
+  });
 
   // UCR extraction
   const ucr = (data.ucr||'').toString().trim();
@@ -727,7 +768,7 @@ function mergeOrCreate(data, filename) {
   if (ucr) {
     ucrExtracted = extractTrackingFromUCR(ucr);
     if (ucrExtracted && !allTrackings.find(t=>t.nr===ucrExtracted)) {
-      allTrackings.push({ carrier: data.transporteur || '', nr: ucrExtracted });
+      allTrackings.push({ carrier: data.transporteur || '', nr: ucrExtracted, url: '' });
     }
   }
 
@@ -757,10 +798,15 @@ function mergeOrCreate(data, filename) {
 
     // Merge transporte
     if (!existing.transporte) existing.transporte = [];
-    allTrackings.forEach(({carrier, nr}) => {
+    allTrackings.forEach(({carrier, nr, url}) => {
       let tEntry = existing.transporte.find(t=>t.transporteur===carrier);
-      if (!tEntry) { tEntry={transporteur:carrier,tracking_nummern:[]}; existing.transporte.push(tEntry); upd.push('Transport '+carrier); }
-      if (!tEntry.tracking_nummern.includes(nr)) { tEntry.tracking_nummern.push(nr); upd.push('Tracking '+nr); }
+      if (!tEntry) { tEntry={transporteur:carrier,tracking_nummern:[],tracking_urls:[]}; existing.transporte.push(tEntry); upd.push('Transport '+carrier); }
+      if (!tEntry.tracking_nummern.includes(nr)) {
+        tEntry.tracking_nummern.push(nr);
+        if (!tEntry.tracking_urls) tEntry.tracking_urls = [];
+        tEntry.tracking_urls.push(url||'');
+        upd.push('Tracking '+nr);
+      }
     });
 
     // Merge ATCs
@@ -786,10 +832,10 @@ function mergeOrCreate(data, filename) {
       versand_usa:data.versand_usa||'Direkt nach DE', transporte: [], verzollt:data.bereits_verzollt||'',
       atc:atcs.join(', '), rechnungsnummer:rechnungen.join(', '), belegs:{}, created:new Date().toISOString() };
     // Group allTrackings by carrier
-    allTrackings.forEach(({carrier,nr})=>{
+    allTrackings.forEach(({carrier,nr,url})=>{
       let t=n.transporte.find(x=>x.transporteur===carrier);
-      if(!t){t={transporteur:carrier,tracking_nummern:[]};n.transporte.push(t);}
-      if(!t.tracking_nummern.includes(nr))t.tracking_nummern.push(nr);
+      if(!t){t={transporteur:carrier,tracking_nummern:[],tracking_urls:[]};n.transporte.push(t);}
+      if(!t.tracking_nummern.includes(nr)){t.tracking_nummern.push(nr);t.tracking_urls.push(url||'');}
     });
     orders.unshift(n);
     const isOrphan = !orderNr && atcs.length;
@@ -808,9 +854,11 @@ function mergeOrCreate(data, filename) {
 // ════════════════════════════════════════════════
 //  TRACKING LINK
 // ════════════════════════════════════════════════
-function trackingURL(nr, carrier) {
+function trackingURL(nr, carrier, storedUrl) {
+  if (storedUrl) return storedUrl;
   const c = (carrier||'').toLowerCase();
-  if (c.includes('fedex')||(/^\d{12,15}$/.test(nr)&&!c.includes('dhl'))) return `https://www.fedex.com/fedextrack/?trknbr=${nr}`;
+  if (c.includes('fedex')||(/^\d{12,15}$/.test(nr)&&!c.includes('dhl')&&!c.includes('express'))) return `https://www.fedex.com/fedextrack/?trknbr=${nr}`;
+  if (c.includes('dhl express')||c.includes('mydhl')||/^\d{10}$/.test(nr)) return `https://mydhl.express.dhl/us/en/tracking.html#/results?id=${nr}`;
   if (c.includes('dhl')) return `https://www.dhl.de/de/privatkunden/pakete-empfangen/verfolgen.html?idc=${nr}`;
   if (c.includes('ups')||nr.startsWith('1Z')) return `https://www.ups.com/track?tracknum=${nr}`;
   return `https://parcelsapp.com/en/tracking/${nr}`;
@@ -819,10 +867,85 @@ function trackingURL(nr, carrier) {
 // ════════════════════════════════════════════════
 //  RENDER TABLE
 // ════════════════════════════════════════════════
+// ════════════════════════════════════════════════
+//  DUPLICATE DETECTION
+// ════════════════════════════════════════════════
+let manuallyDismissedDups = new Set(); // ids dismissed via right-click
+
+function findDuplicates() {
+  const dupIds = new Set();
+  const messages = [];
+
+  // Check order numbers
+  const orderMap = {};
+  orders.forEach(o => {
+    if (!o.order_nummer) return;
+    if (!orderMap[o.order_nummer]) orderMap[o.order_nummer] = [];
+    orderMap[o.order_nummer].push(o.id);
+  });
+  Object.entries(orderMap).forEach(([nr, ids]) => {
+    if (ids.length > 1) {
+      ids.forEach(id => dupIds.add(id));
+      messages.push(`Bestellnummer "${nr}" kommt ${ids.length}× vor`);
+    }
+  });
+
+  // Check tracking numbers across all orders
+  const trackMap = {};
+  orders.forEach(o => {
+    (o.transporte||[]).forEach(t => {
+      (t.tracking_nummern||[]).forEach(nr => {
+        if (!nr) return;
+        if (!trackMap[nr]) trackMap[nr] = [];
+        trackMap[nr].push(o.id);
+      });
+    });
+  });
+  Object.entries(trackMap).forEach(([nr, ids]) => {
+    const unique = [...new Set(ids)];
+    if (unique.length > 1) {
+      unique.forEach(id => dupIds.add(id));
+      messages.push(`Trackingnummer "${nr}" in ${unique.length} Bestellungen`);
+    }
+  });
+
+  return { dupIds, messages };
+}
+
+function showDupAlert(messages) {
+  const alert = document.getElementById('dupAlert');
+  const list = document.getElementById('dupAlertList');
+  if (!messages.length) { alert.classList.remove('active'); return; }
+  list.innerHTML = messages.map(m => `• ${escH(m)}`).join('<br>');
+  alert.classList.add('active');
+}
+
+function closeDupAlert() {
+  document.getElementById('dupAlert').classList.remove('active');
+}
+
+function checkAndShowDuplicates() {
+  const { dupIds, messages } = findDuplicates();
+  showDupAlert(messages);
+  return dupIds;
+}
+
+function removeManualMark(id) {
+  manuallyDismissedDups.add(id);
+  const row = document.querySelector(`tr[data-id="${id}"]`);
+  if (row) row.classList.remove('duplicate-row');
+}
+
 function renderTable() {
   const search = document.getElementById('searchInput').value.toLowerCase();
   const fs = document.getElementById('filterStatus').value;
   const fv = document.getElementById('filterVendor').value;
+
+  // Run duplicate check first
+  const { dupIds, messages } = findDuplicates();
+  showDupAlert(messages);
+  // Clear dismissed marks that are no longer duplicates
+  manuallyDismissedDups.forEach(id => { if(!dupIds.has(id)) manuallyDismissedDups.delete(id); });
 
   let filtered = orders.filter(o => {
     const text = [o.verkaeufer,o.order_nummer,o.atc,o.rechnungsnummer,(o.transporte||[]).map(t=>t.tracking_nummern?.join(' ')).join(' ')].join(' ').toLowerCase();
@@ -845,7 +968,7 @@ function renderTable() {
     const trackHtml = transporte.length ? transporte.map(t=>`
       <div class="track-item">
         <div class="track-carrier">${escH(t.transporteur||'Unbekannt')}</div>
-        ${(t.tracking_nummern||[]).map(nr=>`<a class="track-link" href="${trackingURL(nr,t.transporteur)}" target="_blank" rel="noopener">📦 ${nr.length>18?nr.slice(0,16)+'…':nr}</a>`).join('')}
+        ${(t.tracking_nummern||[]).map((nr,ni)=>`<a class="track-link" href="${trackingURL(nr,t.transporteur,(t.tracking_urls||[])[ni])}" target="_blank" rel="noopener">📦 ${nr.length>18?nr.slice(0,16)+'…':nr}</a>`).join('')}
       </div>`).join('') : '<span style="color:var(--muted);font-size:12px">—</span>';
 
     // ATC
@@ -853,17 +976,23 @@ function renderTable() {
 
     // Belege
     const belegs = o.belegs||{};
+    // Rechnungsnummern aufbereiten
+    const reNrs = (o.rechnungsnummer||'').split(',').map(r=>r.trim()).filter(Boolean);
+    const reHtml = reNrs.length ? reNrs.map(r=>`<div style="font-size:10px;font-family:var(--mono);color:var(--muted);padding:1px 0;white-space:nowrap">${escH(r)}</div>`).join('') : '';
+
     const belegHtml = `<div class="beleg-row">
-      <button class="beleg-btn ${belegs.bestellung?'has-file':'no-file'}" onclick="viewBeleg('${o.id}','bestellung')">${belegs.bestellung?'📦':'📦'} Bestellung</button>
-      <button class="beleg-btn ${belegs.steuer?'has-file':'no-file'}" onclick="viewBeleg('${o.id}','steuer')">${belegs.steuer?'📋':'📋'} Steuerbescheid</button>
-      <button class="beleg-btn ${belegs.rechnung?'has-file':'no-file'}" onclick="viewBeleg('${o.id}','rechnung')">${belegs.rechnung?'🚚':'🚚'} Frachtrechnung</button>
+      <button class="beleg-btn ${belegs.bestellung?'has-file':'no-file'}" onclick="viewBeleg('${o.id}','bestellung')">📦 Bestellung</button>
+      <button class="beleg-btn ${belegs.steuer?'has-file':'no-file'}" onclick="viewBeleg('${o.id}','steuer')">📋 Steuerbescheid</button>
+      <button class="beleg-btn ${belegs.rechnung?'has-file':'no-file'}" onclick="viewBeleg('${o.id}','rechnung')">🚚 Frachtrechnung</button>
+      ${reHtml}
     </div>`;
 
     const preis = o.preis_usd ? `$${parseFloat(o.preis_usd).toLocaleString('de-DE',{minimumFractionDigits:2,maximumFractionDigits:2})}` : '—';
     const verzBadge = o.verzollt==='Ja' ? `<span class="badge badge-green">✓ Ja</span>` : `<span class="badge badge-orange">Offen</span>`;
     const versandBadge = `<span class="badge ${o.versand_usa==='Vorerst zu Axel'?'badge-blue':'badge-gray'}">${escH(o.versand_usa||'—')}</span>`;
+    const isDup = dupIds.has(o.id) && !manuallyDismissedDups.has(o.id);
 
-    return `<tr>
+    return `<tr data-id="${o.id}" ${isDup?'class="duplicate-row"':''} oncontextmenu="handleRowRightClick(event,'${o.id}')">
       <td><strong>${escH(o.verkaeufer||'—')}</strong></td>
       <td class="cell-mono">${escH(o.order_nummer||'—')}</td>
       <td>${escH(o.datum||'—')}</td>
@@ -1193,6 +1322,40 @@ function genId(){return Date.now().toString(36)+Math.random().toString(36).slice
 function setProcessing(on,text){const b=document.getElementById('processingBar');b.classList.toggle('active',on);if(text)document.getElementById('processingText').textContent=text;}
 function showToast(msg,type=''){const t=document.getElementById('toast');t.textContent=msg;t.className='toast show'+(type?' '+type:'');clearTimeout(t._t);t._t=setTimeout(()=>t.classList.remove('show'),3500);}
 function escH(s){return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');}
+
+// ════════════════════════════════════════════════
+//  CONTEXT MENU
+// ════════════════════════════════════════════════
+let ctxCurrentId = null;
+
+function handleRowRightClick(e, id) {
+  e.preventDefault();
+  ctxCurrentId = id;
+  const menu = document.getElementById('ctxMenu');
+  // Show/hide remove mark option based on whether row is marked
+  menu.querySelector('button:first-child').style.display =
+    document.querySelector(`tr[data-id="${id}"]`)?.classList.contains('duplicate-row') ? 'flex' : 'none';
+  menu.style.display = 'block';
+  // Position near cursor, keep within viewport
+  let x = e.clientX, y = e.clientY;
+  if (x + 210 > window.innerWidth) x = window.innerWidth - 215;
+  if (y + 130 > window.innerHeight) y = window.innerHeight - 135;
+  menu.style.left = x + 'px';
+  menu.style.top = y + 'px';
+}
+
+function ctxRemoveMark() {
+  if (ctxCurrentId) removeManualMark(ctxCurrentId);
+  closeCtxMenu();
+}
+
+function closeCtxMenu() {
+  document.getElementById('ctxMenu').style.display = 'none';
+  ctxCurrentId = null;
+}
+
+document.addEventListener('click', closeCtxMenu);
+document.addEventListener('keydown', e => { if(e.key==='Escape') closeCtxMenu(); });
 
 // ════════════════════════════════════════════════
 //  INIT
