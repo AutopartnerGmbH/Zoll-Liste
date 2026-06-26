@@ -4,40 +4,221 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Zoll-Tracker · Autopartner GmbH</title>
+<script>
+// Minimal XLSX writer — produces a valid .xlsx file (ZIP + XML)
+// Supports: string and number cells, one sheet, column widths
+// No external dependencies
+
+const XLSX = (() => {
+  // ── tiny pako-free deflate: use stored (uncompressed) blocks ──
+  function u8(arr) { return new Uint8Array(arr); }
+  function strToU8(s) {
+    const out = [];
+    for (let i = 0; i < s.length; i++) {
+      const c = s.charCodeAt(i);
+      if (c < 128) out.push(c);
+      else if (c < 2048) out.push(192|(c>>6), 128|(c&63));
+      else out.push(224|(c>>12), 128|((c>>6)&63), 128|(c&63));
+    }
+    return new Uint8Array(out);
+  }
+  function crc32(buf) {
+    let c = 0xFFFFFFFF;
+    const t = new Int32Array(256);
+    for (let n=0;n<256;n++){let k=n;for(let j=0;j<8;j++)k=k&1?(0xEDB88320^(k>>>1)):(k>>>1);t[n]=k;}
+    for (let i=0;i<buf.length;i++) c=t[(c^buf[i])&0xff]^(c>>>8);
+    return (c^0xFFFFFFFF)>>>0;
+  }
+  function le16(n){return [n&0xff,(n>>8)&0xff];}
+  function le32(n){return [n&0xff,(n>>8)&0xff,(n>>16)&0xff,(n>>24)&0xff];}
+
+  function deflateStored(data) {
+    // Store blocks (no compression), DEFLATE stored block format
+    const BSIZE = 65535;
+    const out = [];
+    let off = 0;
+    while (off < data.length) {
+      const chunk = data.subarray(off, off + BSIZE);
+      const last = (off + BSIZE >= data.length) ? 1 : 0;
+      const len = chunk.length;
+      out.push(last, len & 0xff, (len >> 8) & 0xff, (~len) & 0xff, (~len >> 8) & 0xff);
+      for (let i = 0; i < chunk.length; i++) out.push(chunk[i]);
+      off += BSIZE;
+    }
+    return new Uint8Array(out);
+  }
+
+  function zlibWrap(data) {
+    // zlib header + deflate stored + adler32
+    const compressed = deflateStored(data);
+    let s1=1,s2=0;
+    for(let i=0;i<data.length;i++){s1=(s1+data[i])%65521;s2=(s2+s1)%65521;}
+    const adler=((s2<<16)|s1)>>>0;
+    return new Uint8Array([0x78,0x9C,...compressed,(adler>>24)&0xff,(adler>>16)&0xff,(adler>>8)&0xff,adler&0xff]);
+  }
+
+  // ── ZIP builder ──
+  function zipEntry(name, data) {
+    const nameBytes = strToU8(name);
+    const compressed = deflateStored(data);
+    const crc = crc32(data);
+    // Local file header
+    const lhdr = new Uint8Array([
+      0x50,0x4B,0x03,0x04, // sig
+      20,0, // version needed
+      0,0,  // flags
+      0,0,  // compression: stored=0
+      0,0,0,0, // mod time/date
+      ...le32(crc),
+      ...le32(compressed.length),
+      ...le32(data.length),
+      ...le16(nameBytes.length),
+      0,0,  // extra len
+      ...nameBytes
+    ]);
+    const offset_placeholder = 0; // will fill in central dir
+    return { name, nameBytes, data, compressed, crc, lhdr };
+  }
+
+  function buildZip(files) {
+    const parts = [];
+    const cdirs = [];
+    let offset = 0;
+
+    files.forEach(f => {
+      const nameBytes = strToU8(f.name);
+      const compressed = deflateStored(f.data);
+      const crc = crc32(f.data);
+      const lhdr = u8([
+        0x50,0x4B,0x03,0x04,20,0,0,0,0,0,0,0,0,0,
+        ...le32(crc),...le32(compressed.length),...le32(f.data.length),
+        ...le16(nameBytes.length),0,0,...nameBytes
+      ]);
+      const startOffset = offset;
+      parts.push(lhdr, compressed);
+      offset += lhdr.length + compressed.length;
+      cdirs.push({ nameBytes, crc, compLen: compressed.length, uncompLen: f.data.length, startOffset });
+    });
+
+    const cdStart = offset;
+    cdirs.forEach(d => {
+      const cdhdr = u8([
+        0x50,0x4B,0x01,0x02,20,0,20,0,0,0,0,0,0,0,0,0,
+        ...le32(d.crc),...le32(d.compLen),...le32(d.uncompLen),
+        ...le16(d.nameBytes.length),0,0,0,0,0,0,0,0,...le32(0),...le32(d.startOffset),
+        ...d.nameBytes
+      ]);
+      parts.push(cdhdr);
+      offset += cdhdr.length;
+    });
+    const cdSize = offset - cdStart;
+    const eocd = u8([
+      0x50,0x4B,0x05,0x06,0,0,0,0,
+      ...le16(cdirs.length),...le16(cdirs.length),
+      ...le32(cdSize),...le32(cdStart),0,0
+    ]);
+    parts.push(eocd);
+
+    // Concat all
+    let total = 0; parts.forEach(p=>total+=p.length);
+    const out = new Uint8Array(total); let pos=0;
+    parts.forEach(p=>{out.set(p,pos);pos+=p.length;});
+    return out;
+  }
+
+  function escXml(s) {
+    return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&apos;');
+  }
+
+  function colLetter(n) {
+    let s=''; n++;
+    while(n>0){s=String.fromCharCode(65+(n-1)%26)+s;n=Math.floor((n-1)/26);}
+    return s;
+  }
+
+  function aoa_to_sheet(aoa, opts) {
+    // Returns sheet object
+    return { _aoa: aoa, _cols: opts?._cols||[] };
+  }
+  function book_new() { return { SheetNames:[], Sheets:{} }; }
+  function book_append_sheet(wb, ws, name) { wb.SheetNames.push(name); wb.Sheets[name]=ws; }
+
+  function buildSheetXML(ws) {
+    const aoa = ws._aoa;
+    const cols = ws['!cols']||[];
+    let colsXml = '';
+    if(cols.length) {
+      colsXml = '<cols>'+cols.map((c,i)=>`<col min="${i+1}" max="${i+1}" width="${c.wch||10}" customWidth="1"/>`).join('')+'</cols>';
+    }
+    let rows='';
+    aoa.forEach((row,ri)=>{
+      let cells='';
+      row.forEach((val,ci)=>{
+        const addr = colLetter(ci)+(ri+1);
+        if(val===''||val===null||val===undefined) return;
+        const num = (typeof val==='number'||(!isNaN(parseFloat(val))&&val!==''));
+        if(num&&typeof val!=='string') {
+          cells+=`<c r="${addr}"><v>${escXml(val)}</v></c>`;
+        } else {
+          cells+=`<c r="${addr}" t="inlineStr"><is><t>${escXml(val)}</t></is></c>`;
+        }
+      });
+      if(cells) rows+=`<row r="${ri+1}">${cells}</row>`;
+    });
+    return `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+${colsXml}<sheetData>${rows}</sheetData></worksheet>`;
+  }
+
+  function writeFile(wb, filename) {
+    const sheetName = wb.SheetNames[0];
+    const ws = wb.Sheets[sheetName];
+    const sheetXML = buildSheetXML(ws);
+
+    const files = [
+      { name:'_rels/.rels', data: strToU8(`<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>`) },
+      { name:'xl/workbook.xml', data: strToU8(`<?xml version="1.0" encoding="UTF-8" standalone="yes"?><workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="${escXml(sheetName)}" sheetId="1" r:id="rId1"/></sheets></workbook>`) },
+      { name:'xl/_rels/workbook.xml.rels', data: strToU8(`<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/></Relationships>`) },
+      { name:'xl/worksheets/sheet1.xml', data: strToU8(sheetXML) },
+      { name:'[Content_Types].xml', data: strToU8(`<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/></Types>`) },
+    ];
+
+    const zip = buildZip(files);
+    const blob = new Blob([zip], {type:'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'});
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a'); a.href=url; a.download=filename; a.click();
+    setTimeout(()=>URL.revokeObjectURL(url),1000);
+  }
+
+  function utils_aoa_to_sheet(aoa) { return { _aoa: aoa, '!cols': [] }; }
+  function utils_book_new() { return book_new(); }
+  function utils_book_append_sheet(wb,ws,name) { book_append_sheet(wb,ws,name); }
+
+  return {
+    utils: { aoa_to_sheet: utils_aoa_to_sheet, book_new: utils_book_new, book_append_sheet: utils_book_append_sheet },
+    writeFile,
+    read(ab) { return null; } // import handled separately via CSV
+  };
+})();
+
+</script>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
 :root{
-  --bg:#F0F2F5;
-  --surface:#FFFFFF;
-  --surface2:#F7F8FA;
-  --border:#E2E5EA;
-  --border2:#CDD1D9;
-  --text:#1C1E24;
-  --muted:#6B7280;
-  --accent:#1D4ED8;
-  --accent-bg:#EEF2FF;
-  --green:#15803D;
-  --green-bg:#DCFCE7;
-  --orange:#C2410C;
-  --orange-bg:#FFF7ED;
-  --red:#B91C1C;
-  --red-bg:#FEF2F2;
-  --mono:'JetBrains Mono','Courier New',monospace;
+  --bg:#F0F2F5;--surface:#FFFFFF;--surface2:#F7F8FA;--border:#E2E5EA;--border2:#CDD1D9;
+  --text:#1C1E24;--muted:#6B7280;--accent:#1D4ED8;--accent-bg:#EEF2FF;
+  --green:#15803D;--green-bg:#DCFCE7;--orange:#C2410C;--orange-bg:#FFF7ED;
+  --red:#B91C1C;--red-bg:#FEF2F2;--mono:'Courier New',monospace;
 }
 body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:var(--bg);color:var(--text);font-size:14px;line-height:1.5;min-height:100vh}
-
-/* ── Header ── */
 header{background:var(--text);color:#fff;padding:14px 24px;display:flex;align-items:center;justify-content:space-between;gap:12px;position:sticky;top:0;z-index:100}
 .header-left{display:flex;align-items:center;gap:14px}
-.logo{font-size:16px;font-weight:700;letter-spacing:-0.3px}
+.logo{font-size:16px;font-weight:700;letter-spacing:-.3px}
 .logo span{color:#60A5FA}
 .badge-count{background:#3B82F6;color:#fff;font-size:11px;font-weight:700;padding:2px 8px;border-radius:99px}
-.header-right{display:flex;gap:8px}
-
-/* ── Buttons ── */
-.btn{display:inline-flex;align-items:center;gap:6px;padding:8px 14px;border:none;border-radius:6px;font-size:13px;font-weight:600;cursor:pointer;transition:all .15s;white-space:nowrap}
-.btn:hover{opacity:.85}
-.btn:disabled{opacity:.4;cursor:not-allowed}
+.header-right{display:flex;gap:8px;flex-wrap:wrap}
+.btn{display:inline-flex;align-items:center;gap:5px;padding:8px 14px;border:none;border-radius:6px;font-size:13px;font-weight:600;cursor:pointer;transition:all .15s;white-space:nowrap}
+.btn:hover{opacity:.85}.btn:disabled{opacity:.4;cursor:not-allowed}
 .btn-primary{background:var(--accent);color:#fff}
 .btn-ghost{background:transparent;color:#fff;border:1px solid rgba(255,255,255,.25)}
 .btn-ghost:hover{background:rgba(255,255,255,.1);opacity:1}
@@ -45,219 +226,204 @@ header{background:var(--text);color:#fff;padding:14px 24px;display:flex;align-it
 .btn-danger{background:var(--red);color:#fff}
 .btn-success{background:var(--green);color:#fff}
 .btn-outline{background:transparent;color:var(--accent);border:1px solid var(--accent)}
-
-/* ── Layout ── */
-.main{max-width:1200px;margin:0 auto;padding:20px 16px;display:grid;gap:16px}
-
-/* ── Upload card ── */
-.upload-card{background:var(--surface);border:2px dashed var(--border2);border-radius:10px;padding:28px 20px;text-align:center;cursor:pointer;transition:all .2s}
+.btn-warm{background:#92400E;color:#fff}
+.main{max-width:1300px;margin:0 auto;padding:20px 16px;display:grid;gap:16px}
+/* Upload */
+.upload-card{background:var(--surface);border:2px dashed var(--border2);border-radius:10px;padding:24px 20px;text-align:center;cursor:pointer;transition:all .2s}
 .upload-card:hover,.upload-card.dragover{border-color:var(--accent);background:var(--accent-bg)}
-.upload-icon{font-size:32px;margin-bottom:8px}
-.upload-title{font-size:15px;font-weight:600;margin-bottom:4px}
+.upload-icon{font-size:28px;margin-bottom:6px}
+.upload-title{font-size:14px;font-weight:600;margin-bottom:3px}
 .upload-sub{font-size:12px;color:var(--muted)}
 #fileInput{display:none}
-
-/* ── Processing ── */
-.processing-bar{background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:16px 20px;display:none;align-items:center;gap:12px}
+/* Processing */
+.processing-bar{background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:14px 20px;display:none;align-items:center;gap:12px}
 .processing-bar.active{display:flex}
-.spinner{width:18px;height:18px;border:2px solid var(--border2);border-top-color:var(--accent);border-radius:50%;animation:spin .7s linear infinite;flex-shrink:0}
+.spinner{width:16px;height:16px;border:2px solid var(--border2);border-top-color:var(--accent);border-radius:50%;animation:spin .7s linear infinite;flex-shrink:0}
 @keyframes spin{to{transform:rotate(360deg)}}
-.processing-text{font-size:13px;color:var(--muted)}
-
-/* ── Toolbar ── */
-.toolbar{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
-.toolbar-left{display:flex;align-items:center;gap:8px;flex:1}
-.search-wrap{position:relative;flex:1;max-width:280px}
-.search-wrap input{width:100%;padding:7px 10px 7px 32px;border:1px solid var(--border);border-radius:6px;font-size:13px;background:var(--surface);color:var(--text)}
-.search-wrap input:focus{outline:2px solid var(--accent);border-color:transparent}
-.search-icon{position:absolute;left:10px;top:50%;transform:translateY(-50%);color:var(--muted);font-size:14px;pointer-events:none}
-.filter-select{padding:7px 10px;border:1px solid var(--border);border-radius:6px;font-size:13px;background:var(--surface);color:var(--text)}
-.filter-select:focus{outline:2px solid var(--accent)}
-
-/* ── Stats row ── */
+/* Log */
+.match-log{background:var(--surface);border:1px solid var(--border);border-radius:10px;overflow:hidden;display:none}
+.match-log.active{display:block}
+.match-log-header{background:var(--surface2);padding:10px 16px;border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between}
+.log-entry{padding:10px 16px;border-bottom:1px solid var(--border);font-size:13px}
+.log-entry:last-child{border-bottom:none}
+.log-main{font-weight:600;display:flex;align-items:center;gap:6px}
+.log-detail{font-size:11px;color:var(--muted);font-family:var(--mono);margin-left:20px;margin-top:2px}
+/* Stats */
 .stats-row{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}
 @media(max-width:640px){.stats-row{grid-template-columns:repeat(2,1fr)}}
 .stat-card{background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:14px 16px}
-.stat-num{font-size:22px;font-weight:700;letter-spacing:-0.5px}
+.stat-num{font-size:22px;font-weight:700;letter-spacing:-.5px}
 .stat-label{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.4px;margin-top:2px}
 .stat-card.blue .stat-num{color:var(--accent)}
 .stat-card.green .stat-num{color:var(--green)}
 .stat-card.orange .stat-num{color:var(--orange)}
-
-/* ── Table ── */
+/* Toolbar */
+.toolbar{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.search-wrap{position:relative;flex:1;max-width:260px}
+.search-wrap input{width:100%;padding:7px 10px 7px 30px;border:1px solid var(--border);border-radius:6px;font-size:13px;background:var(--surface);color:var(--text)}
+.search-wrap input:focus{outline:2px solid var(--accent);border-color:transparent}
+.search-icon{position:absolute;left:9px;top:50%;transform:translateY(-50%);color:var(--muted);font-size:13px;pointer-events:none}
+.filter-select{padding:7px 10px;border:1px solid var(--border);border-radius:6px;font-size:13px;background:var(--surface);color:var(--text)}
+/* Table */
 .table-wrap{background:var(--surface);border:1px solid var(--border);border-radius:10px;overflow:hidden}
 .table-scroll{overflow-x:auto}
-table{width:100%;border-collapse:collapse;min-width:900px}
+table{width:100%;border-collapse:collapse;min-width:1000px}
 thead tr{background:var(--surface2);border-bottom:2px solid var(--border)}
 th{padding:10px 12px;text-align:left;font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.5px;color:var(--muted);white-space:nowrap}
-td{padding:10px 12px;border-bottom:1px solid var(--border);vertical-align:middle;font-size:13px}
+td{padding:9px 12px;border-bottom:1px solid var(--border);vertical-align:top;font-size:13px}
 tr:last-child td{border-bottom:none}
 tr:hover td{background:#FAFBFC}
-.empty-row td{text-align:center;padding:40px;color:var(--muted)}
-
-/* ── Cell types ── */
+.empty-row td{text-align:center;padding:40px;color:var(--muted);vertical-align:middle}
 .cell-mono{font-family:var(--mono);font-size:12px}
-.cell-usd{font-family:var(--mono);font-size:13px;font-weight:600;color:var(--text)}
-.tracking-link{display:inline-flex;align-items:center;gap:4px;color:var(--accent);text-decoration:none;font-family:var(--mono);font-size:11px;font-weight:600;background:var(--accent-bg);padding:2px 7px;border-radius:4px;white-space:nowrap}
-.tracking-link:hover{text-decoration:underline}
-.multi-track{display:flex;flex-direction:column;gap:3px}
-
-/* ── Status badges ── */
-.badge{display:inline-flex;align-items:center;gap:4px;padding:3px 8px;border-radius:99px;font-size:11px;font-weight:600;white-space:nowrap}
+.cell-usd{font-family:var(--mono);font-size:13px;font-weight:600}
+/* Tracking block */
+.track-block{display:flex;flex-direction:column;gap:4px}
+.track-item{display:flex;flex-direction:column;gap:2px;padding:4px 6px;background:var(--surface2);border-radius:4px;border-left:2px solid var(--border2)}
+.track-carrier{font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.4px;color:var(--muted)}
+.track-link{display:inline-flex;align-items:center;gap:3px;color:var(--accent);text-decoration:none;font-family:var(--mono);font-size:11px;font-weight:600}
+.track-link:hover{text-decoration:underline}
+/* Belege buttons */
+.beleg-row{display:flex;flex-direction:column;gap:3px}
+.beleg-btn{display:inline-flex;align-items:center;gap:4px;padding:3px 8px;border:none;border-radius:4px;font-size:11px;font-weight:600;cursor:pointer;transition:all .15s;text-align:left}
+.beleg-btn:hover{opacity:.8}
+.beleg-btn.has-file{background:#DBEAFE;color:#1E40AF}
+.beleg-btn.no-file{background:var(--surface2);color:var(--muted);border:1px dashed var(--border2)}
+.beleg-btn.no-file:hover{border-color:var(--accent);color:var(--accent)}
+/* Badges */
+.badge{display:inline-flex;align-items:center;gap:3px;padding:3px 8px;border-radius:99px;font-size:11px;font-weight:600;white-space:nowrap}
 .badge-green{background:var(--green-bg);color:var(--green)}
 .badge-orange{background:var(--orange-bg);color:var(--orange)}
 .badge-gray{background:var(--border);color:var(--muted)}
 .badge-blue{background:var(--accent-bg);color:var(--accent)}
-
-/* ── ATC cell ── */
-.atc-cell{font-family:var(--mono);font-size:11px;color:var(--text);background:var(--surface2);padding:2px 6px;border-radius:3px;display:inline-block;max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.atc-cell:hover{white-space:normal;overflow:visible;position:relative;z-index:10;background:#fff;box-shadow:0 2px 8px rgba(0,0,0,.15)}
-
-/* ── Row actions ── */
-.row-actions{display:flex;gap:4px;opacity:0;transition:opacity .15s}
+.atc-cell{font-family:var(--mono);font-size:11px;background:var(--surface2);padding:2px 5px;border-radius:3px;display:inline-block;max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;cursor:help}
+.row-actions{display:flex;gap:3px;opacity:0;transition:opacity .15s}
 tr:hover .row-actions{opacity:1}
-
-/* ── Modal ── */
-.modal-overlay{position:fixed;inset:0;background:rgba(0,0,0,.45);z-index:200;display:none;align-items:center;justify-content:center;padding:16px}
+/* Modal */
+.modal-overlay{position:fixed;inset:0;background:rgba(0,0,0,.45);z-index:200;display:none;align-items:flex-start;justify-content:center;padding:20px;overflow-y:auto}
 .modal-overlay.active{display:flex}
-.modal{background:var(--surface);border-radius:12px;width:100%;max-width:560px;max-height:90vh;overflow-y:auto;box-shadow:0 20px 60px rgba(0,0,0,.3)}
+.modal{background:var(--surface);border-radius:12px;width:100%;max-width:680px;margin:auto;box-shadow:0 20px 60px rgba(0,0,0,.3)}
 .modal-header{padding:18px 20px 14px;border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between}
 .modal-title{font-size:15px;font-weight:700}
-.modal-body{padding:20px}
+.modal-body{padding:20px;display:grid;gap:16px}
 .modal-footer{padding:14px 20px;border-top:1px solid var(--border);display:flex;justify-content:flex-end;gap:8px}
 .close-btn{background:none;border:none;font-size:20px;cursor:pointer;color:var(--muted);line-height:1;padding:2px 6px;border-radius:4px}
 .close-btn:hover{background:var(--bg);color:var(--text)}
-
-/* ── Form fields ── */
 .form-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}
-@media(max-width:480px){.form-grid{grid-template-columns:1fr}}
+@media(max-width:500px){.form-grid{grid-template-columns:1fr}}
 .form-full{grid-column:1/-1}
 .field{display:flex;flex-direction:column;gap:4px}
 .field label{font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.4px;color:var(--muted)}
 .field input,.field select,.field textarea{padding:8px 10px;border:1px solid var(--border);border-radius:6px;font-size:13px;background:var(--bg);color:var(--text);font-family:inherit}
 .field input:focus,.field select:focus,.field textarea:focus{outline:2px solid var(--accent);border-color:transparent;background:#fff}
-.field textarea{resize:vertical;min-height:60px;font-family:var(--mono);font-size:12px}
-
-/* ── Toast ── */
-.toast{position:fixed;bottom:20px;right:20px;background:var(--text);color:#fff;padding:10px 16px;border-radius:8px;font-size:13px;font-weight:500;z-index:300;transform:translateY(20px);opacity:0;transition:all .25s;pointer-events:none}
-.toast.show{transform:translateY(0);opacity:1}
-.toast.success{background:var(--green)}
-.toast.error{background:var(--red)}
-
-/* ── API section ── */
-.api-card{background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:16px 20px}
+.field textarea{resize:vertical;min-height:55px;font-family:var(--mono);font-size:12px}
+/* Track section in modal */
+.track-section{border:1px solid var(--border);border-radius:8px;overflow:hidden}
+.track-section-header{background:var(--surface2);padding:10px 14px;display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid var(--border)}
+.track-section-label{font-size:12px;font-weight:700;text-transform:uppercase;letter-spacing:.4px;color:var(--muted)}
+.track-entry{padding:12px 14px;border-bottom:1px solid var(--border);display:grid;grid-template-columns:1fr 1fr;gap:8px}
+.track-entry:last-child{border-bottom:none}
+.track-entry-header{grid-column:1/-1;display:flex;align-items:center;justify-content:space-between;margin-bottom:2px}
+.track-num{font-size:11px;font-weight:700;color:var(--muted)}
+/* Beleg upload in modal */
+.beleg-upload-row{display:flex;align-items:center;gap:8px}
+.beleg-upload-row input[type=file]{display:none}
+.beleg-label-btn{display:inline-flex;align-items:center;gap:5px;padding:5px 10px;border:1px dashed var(--border2);border-radius:5px;font-size:12px;cursor:pointer;color:var(--muted);background:var(--bg)}
+.beleg-label-btn:hover{border-color:var(--accent);color:var(--accent)}
+.beleg-filename{font-size:11px;color:var(--green);font-family:var(--mono)}
+/* Section divider */
+.section-divider{font-size:12px;font-weight:700;text-transform:uppercase;letter-spacing:.5px;color:var(--muted);padding-bottom:4px;border-bottom:1px solid var(--border);margin-bottom:4px}
+/* Save modal */
+.save-options{display:grid;grid-template-columns:1fr 1fr;gap:12px;padding:4px 0}
+.save-option{border:2px solid var(--border);border-radius:8px;padding:16px;text-align:center;cursor:pointer;transition:all .2s}
+.save-option:hover{border-color:var(--accent);background:var(--accent-bg)}
+.save-option .icon{font-size:28px;margin-bottom:6px}
+.save-option .title{font-size:14px;font-weight:700;margin-bottom:3px}
+.save-option .desc{font-size:12px;color:var(--muted)}
+/* API card */
+.api-card{background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:14px 20px}
 .api-row{display:flex;gap:8px;align-items:center}
 .api-row input{flex:1;padding:8px 12px;border:1px solid var(--border);border-radius:6px;font-family:var(--mono);font-size:13px;background:var(--bg);color:var(--text)}
 .api-row input:focus{outline:2px solid var(--accent);border-color:transparent}
-.api-note{font-size:12px;color:var(--muted);margin-top:6px}
-
-/* ── Section label ── */
-.section-label{font-size:12px;font-weight:700;text-transform:uppercase;letter-spacing:.5px;color:var(--muted)}
-
-/* ── Match log ── */
-.match-log{background:var(--surface);border:1px solid var(--border);border-radius:10px;overflow:hidden;display:none}
-.match-log.active{display:block}
-.match-log-header{background:var(--surface2);padding:10px 16px;border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between}
-.match-log-title{font-size:12px;font-weight:700;text-transform:uppercase;letter-spacing:.5px;color:var(--muted)}
-.match-log-body{padding:0}
-.log-entry{padding:12px 16px;border-bottom:1px solid var(--border);font-size:13px;display:grid;gap:3px}
-.log-entry:last-child{border-bottom:none}
-.log-entry.success .log-icon{color:var(--green)}
-.log-entry.warning .log-icon{color:var(--orange)}
-.log-entry.new .log-icon{color:var(--accent)}
-.log-row{display:flex;align-items:baseline;gap:8px}
-.log-icon{font-size:14px;flex-shrink:0}
-.log-main{font-weight:600}
-.log-detail{font-size:12px;color:var(--muted);font-family:var(--mono)}
+.api-note{font-size:12px;color:var(--muted);margin-top:5px}
+/* Toast */
+.toast{position:fixed;bottom:20px;right:20px;background:var(--text);color:#fff;padding:10px 16px;border-radius:8px;font-size:13px;font-weight:500;z-index:400;transform:translateY(20px);opacity:0;transition:all .25s;pointer-events:none;max-width:320px}
+.toast.show{transform:translateY(0);opacity:1}
+.toast.success{background:var(--green)}.toast.error{background:var(--red)}.toast.warning{background:#92400E}
+/* Import hint */
+.import-hint{font-size:12px;color:var(--muted);text-align:center;margin-top:6px}
 </style>
 </head>
 <body>
-
 <header>
   <div class="header-left">
-    <div>
-      <div class="logo">Autopartner <span>Zoll-Tracker</span></div>
-    </div>
+    <div><div class="logo">Autopartner <span>Zoll-Tracker</span></div></div>
     <div class="badge-count" id="totalBadge">0 Bestellungen</div>
   </div>
   <div class="header-right">
+    <button class="btn btn-ghost" onclick="document.getElementById('importInput').click()">↑ Importieren</button>
+    <input type="file" id="importInput" accept=".csv,.json" style="display:none" onchange="importFile(this)" />
     <button class="btn btn-ghost" onclick="openAddModal()">+ Manuell</button>
-    <button class="btn btn-ghost" onclick="exportCSV()">↓ Excel/CSV</button>
+    <button class="btn btn-warm" onclick="openSaveModal()">💾 Speichern</button>
   </div>
 </header>
 
 <div class="main">
-
   <!-- API Key -->
   <div class="api-card">
-    <div class="section-label" style="margin-bottom:8px">Anthropic API-Key</div>
+    <div style="font-size:12px;font-weight:700;text-transform:uppercase;letter-spacing:.5px;color:var(--muted);margin-bottom:8px">Anthropic API-Key</div>
     <div class="api-row">
       <input type="password" id="apiKey" placeholder="sk-ant-api03-…" autocomplete="off" />
       <button class="btn btn-sm btn-outline" onclick="toggleApiKey()">Anzeigen</button>
       <button class="btn btn-sm btn-primary" onclick="saveApiKey()">Speichern</button>
     </div>
-    <div class="api-note" id="apiNote">Schlüssel wird lokal gespeichert und verlässt nicht deinen Browser.</div>
+    <div class="api-note" id="apiNote">Schlüssel wird lokal gespeichert — verlässt nicht deinen Browser.</div>
   </div>
 
   <!-- Upload -->
   <div class="upload-card" id="uploadCard" onclick="document.getElementById('fileInput').click()" ondragover="handleDragOver(event)" ondragleave="handleDragLeave(event)" ondrop="handleDrop(event)">
     <div class="upload-icon">📧</div>
-    <div class="upload-title">Email oder PDF hier reinziehen</div>
-    <div class="upload-sub">Bestellbestätigung · Versandbestätigung · Steuerbescheid · oder klicken zum Auswählen</div>
+    <div class="upload-title">Email oder PDF hier reinziehen — oder klicken</div>
+    <div class="upload-sub">Bestellbestätigung · Versandbestätigung · Steuerbescheid · Frachtrechnung</div>
     <input type="file" id="fileInput" multiple accept=".pdf,.txt,.eml,.msg" onchange="handleFiles(this.files)" />
   </div>
 
   <!-- Processing -->
   <div class="processing-bar" id="processingBar">
     <div class="spinner"></div>
-    <div class="processing-text" id="processingText">KI liest die Dokumente aus…</div>
+    <div id="processingText">KI liest Dokument aus…</div>
   </div>
 
-  <!-- Match Log -->
+  <!-- Log -->
   <div class="match-log" id="matchLog">
     <div class="match-log-header">
-      <div class="match-log-title">📋 Verarbeitungs-Protokoll</div>
+      <div style="font-size:12px;font-weight:700;text-transform:uppercase;letter-spacing:.5px;color:var(--muted)">📋 Verarbeitungs-Protokoll</div>
       <button class="btn btn-sm btn-outline" onclick="clearLog()">Schließen</button>
     </div>
-    <div class="match-log-body" id="matchLogBody"></div>
+    <div id="matchLogBody"></div>
   </div>
 
   <!-- Stats -->
   <div class="stats-row">
-    <div class="stat-card blue">
-      <div class="stat-num" id="statTotal">0</div>
-      <div class="stat-label">Bestellungen gesamt</div>
-    </div>
-    <div class="stat-card orange">
-      <div class="stat-num" id="statPending">0</div>
-      <div class="stat-label">Ausstehend / unterwegs</div>
-    </div>
-    <div class="stat-card green">
-      <div class="stat-num" id="statCleared">0</div>
-      <div class="stat-label">Verzollt</div>
-    </div>
-    <div class="stat-card">
-      <div class="stat-num" id="statUSD">$0</div>
-      <div class="stat-label">Gesamtwert USD</div>
-    </div>
+    <div class="stat-card blue"><div class="stat-num" id="statTotal">0</div><div class="stat-label">Bestellungen gesamt</div></div>
+    <div class="stat-card orange"><div class="stat-num" id="statPending">0</div><div class="stat-label">Ausstehend</div></div>
+    <div class="stat-card green"><div class="stat-num" id="statCleared">0</div><div class="stat-label">Verzollt</div></div>
+    <div class="stat-card"><div class="stat-num" id="statUSD">$0</div><div class="stat-label">Gesamtwert USD</div></div>
   </div>
 
   <!-- Toolbar -->
   <div class="toolbar">
-    <div class="toolbar-left">
-      <div class="search-wrap">
-        <span class="search-icon">🔍</span>
-        <input type="text" id="searchInput" placeholder="Suchen…" oninput="renderTable()" />
-      </div>
-      <select class="filter-select" id="filterStatus" onchange="renderTable()">
-        <option value="">Alle Status</option>
-        <option value="verzollt">Verzollt</option>
-        <option value="offen">Noch offen</option>
-      </select>
-      <select class="filter-select" id="filterVendor" onchange="renderTable()">
-        <option value="">Alle Verkäufer</option>
-      </select>
+    <div class="search-wrap">
+      <span class="search-icon">🔍</span>
+      <input type="text" id="searchInput" placeholder="Suchen…" oninput="renderTable()" />
     </div>
+    <select class="filter-select" id="filterStatus" onchange="renderTable()">
+      <option value="">Alle Status</option>
+      <option value="verzollt">Verzollt</option>
+      <option value="offen">Noch offen</option>
+    </select>
+    <select class="filter-select" id="filterVendor" onchange="renderTable()">
+      <option value="">Alle Verkäufer</option>
+    </select>
     <button class="btn btn-sm btn-danger" onclick="clearAllData()" style="margin-left:auto">🗑 Alle löschen</button>
   </div>
 
@@ -272,520 +438,441 @@ tr:hover .row-actions{opacity:1}
             <th>Datum</th>
             <th>Preis USD</th>
             <th>Versand USA</th>
-            <th>Transporteur</th>
-            <th>Tracking</th>
+            <th>Tracking & Transporte</th>
             <th>Verzollt</th>
-            <th>ATC-Nummer</th>
-            <th>Rechnung-Nr.</th>
+            <th>ATC-Nummer(n)</th>
+            <th>Belege</th>
             <th></th>
           </tr>
         </thead>
         <tbody id="tableBody">
-          <tr class="empty-row"><td colspan="11">Noch keine Bestellungen — Email oder PDF oben reinziehen</td></tr>
+          <tr class="empty-row"><td colspan="10">Noch keine Bestellungen — Email oder PDF oben reinziehen</td></tr>
         </tbody>
       </table>
     </div>
   </div>
+</div>
 
-</div><!-- /main -->
-
-<!-- Add/Edit Modal -->
+<!-- Edit Modal -->
 <div class="modal-overlay" id="editModal">
   <div class="modal">
     <div class="modal-header">
       <div class="modal-title" id="modalTitle">Bestellung bearbeiten</div>
-      <button class="close-btn" onclick="closeModal()">×</button>
+      <button class="close-btn" onclick="closeModal('editModal')">×</button>
     </div>
     <div class="modal-body">
-      <div class="form-grid">
-        <div class="field">
-          <label>Verkäufer</label>
-          <input type="text" id="m_verkaeufer" placeholder="z.B. Rockauto" />
+      <!-- Stammdaten -->
+      <div>
+        <div class="section-divider">Stammdaten</div>
+        <div class="form-grid" style="margin-top:10px">
+          <div class="field"><label>Verkäufer</label><input type="text" id="m_verkaeufer" /></div>
+          <div class="field"><label>Order-Nummer</label><input type="text" id="m_ordernr" /></div>
+          <div class="field"><label>Datum</label><input type="text" id="m_datum" placeholder="TT.MM.JJJJ" /></div>
+          <div class="field"><label>Preis in USD</label><input type="text" id="m_preis" placeholder="z.B. 724.93" /></div>
+          <div class="field"><label>Versand in USA</label>
+            <select id="m_versand">
+              <option value="Direkt nach DE">Direkt nach DE</option>
+              <option value="Vorerst zu Axel">Vorerst zu Axel</option>
+              <option value="">—</option>
+            </select>
+          </div>
+          <div class="field"><label>Bereits verzollt</label>
+            <select id="m_verzollt">
+              <option value="">Nein / offen</option>
+              <option value="Ja">Ja</option>
+            </select>
+          </div>
         </div>
-        <div class="field">
-          <label>Order-Nummer</label>
-          <input type="text" id="m_ordernr" placeholder="z.B. 349713698" />
+      </div>
+
+      <!-- Tracking-Einträge -->
+      <div>
+        <div class="section-divider">Tracking & Transporte <span style="font-weight:400;text-transform:none;font-size:11px">(mehrere möglich)</span></div>
+        <div class="track-section" style="margin-top:10px">
+          <div class="track-section-header">
+            <div class="track-section-label">Transportunternehmen & Tracking</div>
+            <button class="btn btn-sm btn-primary" onclick="addTrackEntry()">+ Hinzufügen</button>
+          </div>
+          <div id="trackEntries"></div>
         </div>
-        <div class="field">
-          <label>Datum</label>
-          <input type="text" id="m_datum" placeholder="TT.MM.JJJJ" />
+      </div>
+
+      <!-- Belege -->
+      <div>
+        <div class="section-divider">Belege</div>
+        <div class="form-grid" style="margin-top:10px">
+          <div class="field">
+            <label>📦 Bestellbestätigung</label>
+            <div class="beleg-upload-row">
+              <label class="beleg-label-btn"><input type="file" id="b_bestellung" accept=".pdf" onchange="handleBelegUpload('bestellung')">📎 PDF auswählen</label>
+              <span class="beleg-filename" id="bf_bestellung"></span>
+              <button class="btn btn-sm" id="bdel_bestellung" style="display:none;background:var(--red-bg);color:var(--red)" onclick="clearBeleg('bestellung')">✕</button>
+            </div>
+          </div>
+          <div class="field">
+            <label>📋 Steuerbescheid(e)</label>
+            <div class="beleg-upload-row">
+              <label class="beleg-label-btn"><input type="file" id="b_steuer" accept=".pdf" multiple onchange="handleBelegUpload('steuer')">📎 PDF auswählen</label>
+              <span class="beleg-filename" id="bf_steuer"></span>
+              <button class="btn btn-sm" id="bdel_steuer" style="display:none;background:var(--red-bg);color:var(--red)" onclick="clearBeleg('steuer')">✕</button>
+            </div>
+          </div>
+          <div class="field form-full">
+            <label>🚚 Frachtrechnung(en) (FedEx / DHL / UPS etc.)</label>
+            <div class="beleg-upload-row">
+              <label class="beleg-label-btn"><input type="file" id="b_rechnung" accept=".pdf" multiple onchange="handleBelegUpload('rechnung')">📎 PDF auswählen</label>
+              <span class="beleg-filename" id="bf_rechnung"></span>
+              <button class="btn btn-sm" id="bdel_rechnung" style="display:none;background:var(--red-bg);color:var(--red)" onclick="clearBeleg('rechnung')">✕</button>
+            </div>
+          </div>
         </div>
-        <div class="field">
-          <label>Preis in USD</label>
-          <input type="text" id="m_preis" placeholder="z.B. 724.93" />
-        </div>
-        <div class="field">
-          <label>Versand in USA</label>
-          <select id="m_versand">
-            <option value="Direkt nach DE">Direkt nach DE</option>
-            <option value="Vorerst zu Axel">Vorerst zu Axel</option>
-            <option value="">—</option>
-          </select>
-        </div>
-        <div class="field">
-          <label>Transporteur</label>
-          <input type="text" id="m_transporteur" placeholder="z.B. FedEx, DHL Express" />
-        </div>
-        <div class="field form-full">
-          <label>Tracking-Nummer(n) — kommagetrennt wenn mehrere</label>
-          <input type="text" id="m_tracking" placeholder="z.B. 873263353010, 497192429236" />
-        </div>
-        <div class="field">
-          <label>Bereits verzollt</label>
-          <select id="m_verzollt">
-            <option value="">Nein / offen</option>
-            <option value="Ja">Ja</option>
-          </select>
-        </div>
-        <div class="field">
-          <label>Rechnungsnummer</label>
-          <input type="text" id="m_rechnung" placeholder="z.B. RE FedEx 868960609" />
-        </div>
-        <div class="field form-full">
-          <label>ATC-Nummer(n) — kommagetrennt wenn mehrere</label>
-          <textarea id="m_atc" placeholder="z.B. AT/X/12/044701/06/2026/7154"></textarea>
+      </div>
+
+      <!-- ATC / Rechnung -->
+      <div>
+        <div class="section-divider">Zoll</div>
+        <div class="form-grid" style="margin-top:10px">
+          <div class="field form-full"><label>ATC/ATX-Nummer(n) — kommagetrennt bei mehreren</label><textarea id="m_atc" placeholder="z.B. AT/X/12/044701/06/2026/7154"></textarea></div>
+          <div class="field form-full"><label>Rechnungsnummer(n) Transportunternehmen</label><textarea id="m_rechnung_nr" placeholder="z.B. RE FedEx 868960609, RE DHL 123456"></textarea></div>
         </div>
       </div>
     </div>
     <div class="modal-footer">
-      <button class="btn btn-ghost" style="color:var(--text);border:1px solid var(--border)" onclick="closeModal()">Abbrechen</button>
+      <button class="btn" style="color:var(--text);border:1px solid var(--border)" onclick="closeModal('editModal')">Abbrechen</button>
       <button class="btn btn-primary" onclick="saveModal()">Speichern</button>
     </div>
   </div>
 </div>
 
-<!-- Toast -->
+<!-- Save Modal -->
+<div class="modal-overlay" id="saveModal">
+  <div class="modal" style="max-width:420px">
+    <div class="modal-header">
+      <div class="modal-title">💾 Backup speichern</div>
+      <button class="close-btn" onclick="closeModal('saveModal')">×</button>
+    </div>
+    <div class="modal-body">
+      <div class="save-options">
+        <div class="save-option" onclick="doExport('xlsx');closeModal('saveModal')">
+          <div class="icon">📊</div>
+          <div class="title">Excel (.xlsx)</div>
+          <div class="desc">Gleiche Spaltenstruktur wie bisherige Liste — direkt in Excel öffnen</div>
+        </div>
+        <div class="save-option" onclick="doExport('csv');closeModal('saveModal')">
+          <div class="icon">📄</div>
+          <div class="title">CSV-Datei</div>
+          <div class="desc">Kompatibel mit Excel, LibreOffice und anderen Programmen</div>
+        </div>
+        <div class="save-option" onclick="doExport('json');closeModal('saveModal')">
+          <div class="icon">🔄</div>
+          <div class="title">JSON-Backup</div>
+          <div class="desc">Vollständige Sicherung inkl. aller Daten — kann wieder importiert werden</div>
+        </div>
+        <div class="save-option" onclick="doExport('all');closeModal('saveModal')">
+          <div class="icon">📦</div>
+          <div class="title">Alle drei</div>
+          <div class="desc">XLSX + CSV + JSON auf einmal speichern</div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Beleg View Modal -->
+<div class="modal-overlay" id="belegModal">
+  <div class="modal" style="max-width:800px">
+    <div class="modal-header">
+      <div class="modal-title" id="belegModalTitle">Beleg</div>
+      <button class="close-btn" onclick="closeModal('belegModal')">×</button>
+    </div>
+    <div class="modal-body" style="padding:0">
+      <iframe id="belegFrame" style="width:100%;height:70vh;border:none"></iframe>
+    </div>
+  </div>
+</div>
+
 <div class="toast" id="toast"></div>
 
 <script>
-// ══════════════════════════════════════════════════════
-//  DATA
-// ══════════════════════════════════════════════════════
-let orders = JSON.parse(localStorage.getItem('zoll_orders') || '[]');
+// ════════════════════════════════════════════════
+//  STATE
+// ════════════════════════════════════════════════
+let orders = [];
 let editingId = null;
+let tempBelegs = {}; // {bestellung: {name, data}, steuer: [...], rechnung: [...]}
+let trackEntryCount = 0;
+let logEntries = [];
+let backupDoneToday = false;
+let notifPermission = false;
 
+function loadData() {
+  try { orders = JSON.parse(localStorage.getItem('zoll_orders') || '[]'); } catch { orders = []; }
+}
 function saveData() {
-  localStorage.setItem('zoll_orders', JSON.stringify(orders));
+  try { localStorage.setItem('zoll_orders', JSON.stringify(orders)); } catch(e) {
+    showToast('⚠️ Speicher voll — bitte JSON-Backup erstellen!', 'warning');
+  }
 }
+loadData();
 
-function genId() {
-  return Date.now().toString(36) + Math.random().toString(36).slice(2,5);
-}
-
-// ══════════════════════════════════════════════════════
+// ════════════════════════════════════════════════
 //  API KEY
-// ══════════════════════════════════════════════════════
+// ════════════════════════════════════════════════
 const savedKey = localStorage.getItem('zoll_api_key') || '';
-if (savedKey) document.getElementById('apiKey').value = savedKey;
-
+if (savedKey) { document.getElementById('apiKey').value = savedKey; document.getElementById('apiNote').textContent = '✓ Gespeichert.'; }
 function getKey() { return document.getElementById('apiKey').value.trim(); }
-
 function saveApiKey() {
   const k = getKey();
   if (!k) { showToast('Kein API-Key eingegeben', 'error'); return; }
   localStorage.setItem('zoll_api_key', k);
   showToast('API-Key gespeichert ✓', 'success');
-  document.getElementById('apiNote').textContent = '✓ Gespeichert — bleibt auch nach Schließen erhalten.';
+  document.getElementById('apiNote').textContent = '✓ Gespeichert.';
 }
+function toggleApiKey() { const i = document.getElementById('apiKey'); i.type = i.type === 'password' ? 'text' : 'password'; }
 
-function toggleApiKey() {
-  const inp = document.getElementById('apiKey');
-  inp.type = inp.type === 'password' ? 'text' : 'password';
-}
-
-// ══════════════════════════════════════════════════════
-//  FILE HANDLING
-// ══════════════════════════════════════════════════════
-function handleDragOver(e) {
-  e.preventDefault();
-  document.getElementById('uploadCard').classList.add('dragover');
-}
-function handleDragLeave(e) {
-  document.getElementById('uploadCard').classList.remove('dragover');
-}
-function handleDrop(e) {
-  e.preventDefault();
-  document.getElementById('uploadCard').classList.remove('dragover');
-  handleFiles(e.dataTransfer.files);
-}
+// ════════════════════════════════════════════════
+//  FILE DROP
+// ════════════════════════════════════════════════
+function handleDragOver(e) { e.preventDefault(); document.getElementById('uploadCard').classList.add('dragover'); }
+function handleDragLeave() { document.getElementById('uploadCard').classList.remove('dragover'); }
+function handleDrop(e) { e.preventDefault(); handleDragLeave(); handleFiles(e.dataTransfer.files); }
 
 async function handleFiles(files) {
-  if (!files || !files.length) return;
+  if (!files?.length) return;
   const key = getKey();
   if (!key) { showToast('Bitte zuerst API-Key eingeben', 'error'); return; }
-
   setProcessing(true, `${files.length} Dokument(e) werden ausgelesen…`);
-
-  for (const file of files) {
-    try {
-      await processFile(file, key);
-    } catch(e) {
-      showToast('Fehler bei ' + file.name + ': ' + e.message, 'error');
-    }
+  for (const f of files) {
+    try { await processFile(f, key); }
+    catch(e) { addLog('error', 'Fehler: ' + f.name, [e.message]); showToast('Fehler: ' + e.message, 'error'); }
   }
-
   setProcessing(false);
-  renderTable();
-  updateStats();
+  renderTable(); updateStats();
   document.getElementById('fileInput').value = '';
 }
 
 async function processFile(file, key) {
-  // Read file content
-  let content = '';
-  let isBase64 = false;
-  let mediaType = '';
-
+  let messages;
   if (file.type === 'application/pdf' || file.name.endsWith('.pdf')) {
-    // Send as base64 PDF to Claude
     const ab = await file.arrayBuffer();
     const bytes = new Uint8Array(ab);
-    let binary = '';
-    for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
-    content = btoa(binary);
-    isBase64 = true;
-    mediaType = 'application/pdf';
+    let bin = ''; for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+    const b64 = btoa(bin);
+    messages = [{ role:'user', content:[
+      { type:'document', source:{ type:'base64', media_type:'application/pdf', data:b64 }},
+      { type:'text', text:'Extrahiere die Zolldaten aus diesem Dokument.' }
+    ]}];
   } else {
-    content = await file.text();
+    const text = await file.text();
+    messages = [{ role:'user', content:'Extrahiere die Zolldaten:\n\n' + text }];
   }
 
-  const systemPrompt = `Du bist ein Zoll-Datenextraktor für Autopartner GmbH, ein US-Autoersatzteilhändler in Deutschland.
-Extrahiere aus dem Dokument die Zolldaten und gib NUR ein JSON-Objekt zurück (kein Markdown, keine Erklärungen).
-
+  const sys = `Du bist ein Zoll-Datenextraktor für Autopartner GmbH.
+Gib NUR ein JSON-Objekt zurück (kein Markdown, keine Erklärungen).
 Felder:
-- verkaeufer: Verkäufer/Shop-Name (z.B. "Rockauto", "ebay", "Summit Racing")
-- order_nummer: Bestellnummer/Order-ID als String
-- datum: Datum im Format TT.MM.JJJJ (Bestelldatum oder Rechnungsdatum)
-- preis_usd: Kaufpreis in USD als Zahl mit Punkt (NUR USD, nie Euro — wenn nur Euro angegeben: null)
-- versand_usa: "Direkt nach DE" oder "Vorerst zu Axel" oder ""
-- transporteur: Transporteur(e) für Zustellung in DE (z.B. "FedEx", "DHL Express", "UPS")
-- tracking_nummern: Array von Trackingnummern als Strings (alle gefundenen)
-- bereits_verzollt: "Ja" oder "" 
-- atc_nummern: Array von ATC/ATX-Nummern (z.B. ["AT/X/12/044701/06/2026/7154"])
-- rechnungsnummer: Rechnungsnummer des Transporteurs (z.B. "RE FedEx 868960609")
-- ucr: UCR-Nummer (Unique Consignment Reference) vollständig (z.B. "873263353010_26061905")
-- dokument_typ: "bestellung" | "versand" | "steuerbescheid" | "rechnung" | "unbekannt"
-
-Wichtig: Preis immer USD. Wenn Dokument nur Euro zeigt und kein USD-Äquivalent: null für preis_usd.
-Bei Steuerbescheid: ATC-Nummer, UCR und Trackingnummer/UCR sind wichtig. Die UCR enthält oft die Trackingnummer vor dem Unterstrich (z.B. UCR "873263353010_26061905" → Tracking "873263353010").`;
-
-  let messages;
-  if (isBase64) {
-    messages = [{
-      role: 'user',
-      content: [{
-        type: 'document',
-        source: { type: 'base64', media_type: mediaType, data: content }
-      }, {
-        type: 'text',
-        text: 'Extrahiere die Zolldaten aus diesem Dokument.'
-      }]
-    }];
-  } else {
-    messages = [{
-      role: 'user',
-      content: `Extrahiere die Zolldaten aus diesem Dokument:\n\n${content}`
-    }];
-  }
+- verkaeufer: Shop-Name (z.B. "Rockauto")
+- order_nummer: Bestellnummer als String
+- datum: TT.MM.JJJJ
+- preis_usd: Kaufpreis in USD als Zahl (null wenn nur EUR)
+- versand_usa: "Direkt nach DE" | "Vorerst zu Axel" | ""
+- transporte: Array von Objekten [{transporteur:"FedEx", tracking_nummern:["123","456"]}] — pro Transportunternehmen ein Objekt, alle Trackingnummern dieses Unternehmens im Array
+- bereits_verzollt: "Ja" | ""
+- atc_nummern: Array von ATC/ATX-Nummern
+- ucr: UCR vollständig (z.B. "873263353010_26061905")
+- rechnungsnummern: Array von Rechnungsnummern des Transporteurs
+- dokument_typ: "bestellung"|"versand"|"steuerbescheid"|"rechnung"|"unbekannt"
+Wichtig: Bei Steuerbescheid UCR extrahieren — der Teil vor "_" in der UCR ist meist die Trackingnummer.`;
 
   const resp = await fetch('https://api.anthropic.com/v1/messages', {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'x-api-key': key,
-      'anthropic-version': '2023-06-01',
-      'anthropic-dangerous-direct-browser-access': 'true'
-    },
-    body: JSON.stringify({
-      model: 'claude-sonnet-4-6',
-      max_tokens: 1000,
-      system: systemPrompt,
-      messages
-    })
+    method:'POST',
+    headers:{ 'Content-Type':'application/json','x-api-key':key,'anthropic-version':'2023-06-01','anthropic-dangerous-direct-browser-access':'true' },
+    body:JSON.stringify({ model:'claude-sonnet-4-6', max_tokens:1500, system:sys, messages })
   });
-
-  if (!resp.ok) {
-    const err = await resp.json().catch(() => ({}));
-    throw new Error(err.error?.message || `HTTP ${resp.status}`);
-  }
-
+  if (!resp.ok) { const e = await resp.json().catch(()=>({})); throw new Error(e.error?.message || `HTTP ${resp.status}`); }
   const result = await resp.json();
-  const raw = result.content?.map(c => c.text || '').join('').trim();
-  const cleaned = raw.replace(/^```json\s*/i,'').replace(/^```\s*/i,'').replace(/\s*```$/i,'').trim();
-
+  const raw = result.content?.map(c=>c.text||'').join('').trim().replace(/^```json\s*/i,'').replace(/^```\s*/i,'').replace(/\s*```$/i,'').trim();
   let data;
-  try { data = JSON.parse(cleaned); }
-  catch { throw new Error('Antwort konnte nicht geparst werden'); }
-
+  try { data = JSON.parse(raw); } catch { throw new Error('Antwort konnte nicht geparst werden'); }
   mergeOrCreate(data, file.name);
 }
 
-// ══════════════════════════════════════════════════════
-//  UCR EXTRACTION — pull tracking number from UCR
-//  UCR format: 873263353010_26061905 → "873263353010"
-// ══════════════════════════════════════════════════════
+// ════════════════════════════════════════════════
+//  UCR EXTRACTION
+// ════════════════════════════════════════════════
 function extractTrackingFromUCR(ucr) {
   if (!ucr) return null;
-  // UCR is typically: <trackingnummer>_<datum> or <trackingnummer>_<referenz>
-  const match = ucr.match(/^([A-Z0-9]{8,}?)_/i);
-  if (match) return match[1];
-  // If no underscore, the whole UCR might be the tracking nr
+  const m = ucr.match(/^([A-Z0-9]{8,})_/i);
+  if (m) return m[1];
   if (/^\d{10,}$/.test(ucr)) return ucr;
   return null;
 }
 
-// ══════════════════════════════════════════════════════
-//  MATCH LOG
-// ══════════════════════════════════════════════════════
-let logEntries = [];
-
-function addLogEntry(type, main, details) {
-  logEntries.unshift({ type, main, details, time: new Date().toLocaleTimeString('de-DE', {hour:'2-digit',minute:'2-digit',second:'2-digit'}) });
-  renderLog();
-}
-
-function renderLog() {
-  const log = document.getElementById('matchLog');
-  const body = document.getElementById('matchLogBody');
-  if (!logEntries.length) { log.classList.remove('active'); return; }
-  log.classList.add('active');
-
-  const icons = { success: '✅', warning: '⚠️', new: '🆕' };
-  body.innerHTML = logEntries.map(e => `
-    <div class="log-entry ${e.type}">
-      <div class="log-row">
-        <span class="log-icon">${icons[e.type] || 'ℹ️'}</span>
-        <span class="log-main">${escHtml(e.main)}</span>
-        <span style="margin-left:auto;font-size:11px;color:var(--muted)">${e.time}</span>
-      </div>
-      ${e.details.map(d => `<div class="log-detail" style="margin-left:22px">→ ${escHtml(d)}</div>`).join('')}
-    </div>
-  `).join('');
-}
-
-function clearLog() {
-  logEntries = [];
-  document.getElementById('matchLog').classList.remove('active');
-}
-
-// ══════════════════════════════════════════════════════
-//  MERGE LOGIC — find existing order or create new
-// ══════════════════════════════════════════════════════
+// ════════════════════════════════════════════════
+//  MERGE LOGIC
+// ════════════════════════════════════════════════
 function mergeOrCreate(data, filename) {
   const orderNr = (data.order_nummer || '').toString().trim();
-  const atcs = (data.atc_nummern || []).map(a => a.toString().trim()).filter(Boolean);
+  const atcs = (data.atc_nummern || []).map(a=>a.toString().trim()).filter(Boolean);
+  const rechnungen = (data.rechnungsnummern || []).map(r=>r.toString().trim()).filter(Boolean);
   const docType = data.dokument_typ || 'unbekannt';
 
-  // Build tracking list — also extract from UCR if present
-  let trackings = (data.tracking_nummern || []).map(t => t.toString().trim()).filter(Boolean);
-  const ucr = (data.ucr || '').toString().trim();
+  // Build flat tracking list from transporte array
+  const transporte = (data.transporte || []).filter(t=>t.transporteur||t.tracking_nummern?.length);
+  let allTrackings = [];
+  transporte.forEach(t => { (t.tracking_nummern||[]).forEach(tr=>{ if(tr) allTrackings.push({carrier:t.transporteur||'',nr:tr.toString().trim()}); }); });
+
+  // UCR extraction
+  const ucr = (data.ucr||'').toString().trim();
   let ucrExtracted = null;
   if (ucr) {
     ucrExtracted = extractTrackingFromUCR(ucr);
-    if (ucrExtracted && !trackings.includes(ucrExtracted)) {
-      trackings.push(ucrExtracted);
-    }
-  }
-  // Also try to extract from ATC context: if tracking_nummern empty but UCR known
-  if (!trackings.length && atcs.length) {
-    // Try extracting from first ATC if it looks like it has a tracking embedded
-    const ucrFromFilename = filename.match(/([A-Z]{2}[0-9]{10,})/i);
-    if (ucrFromFilename) {
-      const fromFile = extractTrackingFromUCR(ucrFromFilename[1] + '_x');
-      if (fromFile) trackings.push(fromFile);
+    if (ucrExtracted && !allTrackings.find(t=>t.nr===ucrExtracted)) {
+      allTrackings.push({ carrier: data.transporteur || '', nr: ucrExtracted });
     }
   }
 
-  // ── Step 1: Find by order number ──
-  let existing = null;
-  let matchMethod = '';
-  if (orderNr) {
-    existing = orders.find(o => o.order_nummer === orderNr);
-    if (existing) matchMethod = `Order-Nummer ${orderNr}`;
-  }
-
-  // ── Step 2: Find by tracking number overlap ──
-  if (!existing && trackings.length) {
-    for (const track of trackings) {
-      const found = orders.find(o => {
-        const existTracks = (o.tracking || '').split(',').map(t => t.trim()).filter(Boolean);
-        return existTracks.includes(track);
-      });
-      if (found) {
-        existing = found;
-        matchMethod = `Trackingnummer ${track}`;
-        if (ucrExtracted && track === ucrExtracted) {
-          matchMethod = `UCR-Extraktion → Trackingnummer ${ucrExtracted}`;
-        }
-        break;
-      }
+  // Find existing
+  let existing = null, matchMethod = '';
+  if (orderNr) { existing = orders.find(o=>o.order_nummer===orderNr); if(existing) matchMethod='Order-Nummer '+orderNr; }
+  if (!existing && allTrackings.length) {
+    for (const t of allTrackings) {
+      const found = orders.find(o=>(o.transporte||[]).some(tr=>(tr.tracking_nummern||[]).includes(t.nr)));
+      if (found) { existing=found; matchMethod=(t.nr===ucrExtracted?'UCR-Extraktion → ':'')+'Tracking '+t.nr; break; }
     }
   }
 
-  const logDetails = [];
-  if (filename) logDetails.push(`Datei: ${filename}`);
-  if (docType !== 'unbekannt') logDetails.push(`Dokumenttyp: ${docType}`);
-  if (ucr) logDetails.push(`UCR: ${ucr}`);
-  if (ucrExtracted) logDetails.push(`Extrahierte Trackingnummer aus UCR: ${ucrExtracted}`);
-  if (trackings.length) logDetails.push(`Gefundene Trackingnummern: ${trackings.join(', ')}`);
-  if (atcs.length) logDetails.push(`ATC-Nummern: ${atcs.join(', ')}`);
+  const logD = [`Datei: ${filename}`, `Typ: ${docType}`];
+  if (ucr) logD.push(`UCR: ${ucr}`);
+  if (ucrExtracted) logD.push(`Tracking aus UCR: ${ucrExtracted}`);
+  if (allTrackings.length) logD.push(`Trackings: ${allTrackings.map(t=>(t.carrier?t.carrier+' ':'')+t.nr).join(', ')}`);
+  if (atcs.length) logD.push(`ATC: ${atcs.join(', ')}`);
 
   if (existing) {
-    // ── MERGE ──
-    const updated = [];
+    const upd = [];
+    if (data.verkaeufer && !existing.verkaeufer) { existing.verkaeufer=data.verkaeufer; upd.push('Verkäufer'); }
+    if (orderNr && !existing.order_nummer) { existing.order_nummer=orderNr; upd.push('Order-Nr'); }
+    if (data.datum && !existing.datum) { existing.datum=data.datum; upd.push('Datum'); }
+    if (data.preis_usd && !existing.preis_usd) { existing.preis_usd=data.preis_usd; upd.push('Preis'); }
+    if (data.versand_usa && !existing.versand_usa) { existing.versand_usa=data.versand_usa; upd.push('Versand'); }
 
-    if (data.verkaeufer && !existing.verkaeufer) { existing.verkaeufer = data.verkaeufer; updated.push('Verkäufer'); }
-    if (orderNr && !existing.order_nummer) { existing.order_nummer = orderNr; updated.push('Order-Nr'); }
-    if (data.datum && !existing.datum) { existing.datum = data.datum; updated.push('Datum'); }
-    if (data.preis_usd && !existing.preis_usd) { existing.preis_usd = data.preis_usd; updated.push('Preis USD'); }
-    if (data.versand_usa && !existing.versand_usa) { existing.versand_usa = data.versand_usa; updated.push('Versand USA'); }
-    if (data.transporteur && !existing.transporteur) { existing.transporteur = data.transporteur; updated.push('Transporteur'); }
+    // Merge transporte
+    if (!existing.transporte) existing.transporte = [];
+    allTrackings.forEach(({carrier, nr}) => {
+      let tEntry = existing.transporte.find(t=>t.transporteur===carrier);
+      if (!tEntry) { tEntry={transporteur:carrier,tracking_nummern:[]}; existing.transporte.push(tEntry); upd.push('Transport '+carrier); }
+      if (!tEntry.tracking_nummern.includes(nr)) { tEntry.tracking_nummern.push(nr); upd.push('Tracking '+nr); }
+    });
 
-    if (trackings.length) {
-      const existTracks = (existing.tracking || '').split(',').map(t=>t.trim()).filter(Boolean);
-      const newTracks = trackings.filter(t => !existTracks.includes(t));
-      if (newTracks.length) {
-        existing.tracking = [...existTracks, ...newTracks].join(', ');
-        updated.push(`Tracking (${newTracks.join(', ')})`);
-      }
-    }
+    // Merge ATCs
+    if (!existing.atc) existing.atc='';
+    const exAtcs = existing.atc.split(',').map(a=>a.trim()).filter(Boolean);
+    const newAtcs = atcs.filter(a=>!exAtcs.includes(a));
+    if (newAtcs.length) { existing.atc=[...exAtcs,...newAtcs].join(', '); upd.push('ATC'); }
 
-    if (atcs.length) {
-      const existAtcs = (existing.atc || '').split(',').map(a=>a.trim()).filter(Boolean);
-      const newAtcs = atcs.filter(a => !existAtcs.includes(a));
-      if (newAtcs.length) {
-        existing.atc = [...existAtcs, ...newAtcs].join(', ');
-        updated.push(`ATC-Nummer (${newAtcs.join(', ')})`);
-      }
-    }
+    // Merge Rechnungen
+    if (!existing.rechnungsnummer) existing.rechnungsnummer='';
+    const exRe = existing.rechnungsnummer.split(',').map(r=>r.trim()).filter(Boolean);
+    const newRe = rechnungen.filter(r=>!exRe.includes(r));
+    if (newRe.length) { existing.rechnungsnummer=[...exRe,...newRe].join(', '); upd.push('Rechnung-Nr'); }
 
-    if (data.bereits_verzollt === 'Ja' && existing.verzollt !== 'Ja') {
-      existing.verzollt = 'Ja';
-      updated.push('Verzollt = Ja');
-    }
-    if (data.rechnungsnummer && !existing.rechnungsnummer) {
-      existing.rechnungsnummer = data.rechnungsnummer;
-      updated.push('Rechnungsnummer');
-    }
+    if (data.bereits_verzollt==='Ja'&&existing.verzollt!=='Ja') { existing.verzollt='Ja'; upd.push('Verzollt'); }
 
-    logDetails.push(`Match-Methode: ${matchMethod}`);
-    if (updated.length) logDetails.push(`Aktualisierte Felder: ${updated.join(', ')}`);
-    else logDetails.push('Keine neuen Felder — alles bereits vorhanden');
-
-    addLogEntry('success',
-      `Bestellung ${existing.order_nummer || existing.verkaeufer} aktualisiert`,
-      logDetails
-    );
-    showToast(`✓ ${existing.order_nummer || existing.verkaeufer} aktualisiert`, 'success');
-
+    logD.push(`Match: ${matchMethod}`);
+    logD.push(upd.length?'Aktualisiert: '+upd.join(', '):'Keine neuen Felder');
+    addLog('success', `✅ ${existing.order_nummer||existing.verkaeufer} aktualisiert`, logD);
+    showToast(`✓ ${existing.order_nummer||existing.verkaeufer} aktualisiert`, 'success');
   } else {
-    // ── CREATE ──
-    const newOrder = {
-      id: genId(),
-      verkaeufer: data.verkaeufer || '',
-      order_nummer: orderNr,
-      datum: data.datum || '',
-      preis_usd: data.preis_usd || '',
-      versand_usa: data.versand_usa || 'Direkt nach DE',
-      transporteur: data.transporteur || '',
-      tracking: trackings.join(', '),
-      verzollt: data.bereits_verzollt || '',
-      atc: atcs.join(', '),
-      rechnungsnummer: data.rechnungsnummer || '',
-      created: new Date().toISOString(),
-      source_file: filename
-    };
-    orders.unshift(newOrder);
-
-    if (!orderNr && atcs.length) {
-      logDetails.push('⚠️ Kein Order-Match gefunden — als neue Zeile angelegt. Bitte manuell zuordnen falls Bestellung bereits existiert.');
-      addLogEntry('warning',
-        `Steuerbescheid ohne Bestellungs-Match → neue Zeile angelegt`,
-        logDetails
-      );
-      showToast('⚠️ Kein Match gefunden — neue Zeile angelegt', 'warning');
+    const n = { id:genId(), verkaeufer:data.verkaeufer||'', order_nummer:orderNr, datum:data.datum||'', preis_usd:data.preis_usd||'',
+      versand_usa:data.versand_usa||'Direkt nach DE', transporte: [], verzollt:data.bereits_verzollt||'',
+      atc:atcs.join(', '), rechnungsnummer:rechnungen.join(', '), belegs:{}, created:new Date().toISOString() };
+    // Group allTrackings by carrier
+    allTrackings.forEach(({carrier,nr})=>{
+      let t=n.transporte.find(x=>x.transporteur===carrier);
+      if(!t){t={transporteur:carrier,tracking_nummern:[]};n.transporte.push(t);}
+      if(!t.tracking_nummern.includes(nr))t.tracking_nummern.push(nr);
+    });
+    orders.unshift(n);
+    const isOrphan = !orderNr && atcs.length;
+    if (isOrphan) {
+      logD.push('⚠️ Kein Bestellungs-Match — bitte manuell zuordnen');
+      addLog('warning', '⚠️ Steuerbescheid ohne Match — neue Zeile', logD);
+      showToast('⚠️ Kein Match — neue Zeile angelegt', 'warning');
     } else {
-      addLogEntry('new',
-        `Neue Bestellung: ${newOrder.verkaeufer || 'unbekannt'} ${orderNr || ''}`,
-        logDetails
-      );
-      showToast(`✓ Neue Bestellung angelegt (${newOrder.verkaeufer || 'unbekannt'})`, 'success');
+      addLog('new', `🆕 Neue Bestellung: ${n.verkaeufer} ${orderNr}`, logD);
+      showToast(`✓ Neue Bestellung: ${n.verkaeufer||'unbekannt'}`, 'success');
     }
   }
-
   saveData();
 }
 
-// ══════════════════════════════════════════════════════
-//  TRACKING LINKS
-// ══════════════════════════════════════════════════════
-function trackingLink(trackingStr, transporteur) {
-  if (!trackingStr) return '<span style="color:var(--muted);font-size:12px">—</span>';
-  const tracks = trackingStr.split(',').map(t => t.trim()).filter(Boolean);
-  const carrier = (transporteur || '').toLowerCase();
-
-  return tracks.map(t => {
-    let url = '';
-    if (carrier.includes('fedex') || t.match(/^\d{12,15}$/)) {
-      url = `https://www.fedex.com/fedextrack/?trknbr=${t}`;
-    } else if (carrier.includes('dhl')) {
-      url = `https://www.dhl.de/de/privatkunden/pakete-empfangen/verfolgen.html?idc=${t}`;
-    } else if (carrier.includes('ups') || t.startsWith('1Z')) {
-      url = `https://www.ups.com/track?tracknum=${t}`;
-    } else {
-      url = `https://parcelsapp.com/en/tracking/${t}`;
-    }
-    return `<a class="tracking-link" href="${url}" target="_blank" rel="noopener">📦 ${t.length > 16 ? t.slice(0,14)+'…' : t}</a>`;
-  }).join('');
+// ════════════════════════════════════════════════
+//  TRACKING LINK
+// ════════════════════════════════════════════════
+function trackingURL(nr, carrier) {
+  const c = (carrier||'').toLowerCase();
+  if (c.includes('fedex')||(/^\d{12,15}$/.test(nr)&&!c.includes('dhl'))) return `https://www.fedex.com/fedextrack/?trknbr=${nr}`;
+  if (c.includes('dhl')) return `https://www.dhl.de/de/privatkunden/pakete-empfangen/verfolgen.html?idc=${nr}`;
+  if (c.includes('ups')||nr.startsWith('1Z')) return `https://www.ups.com/track?tracknum=${nr}`;
+  return `https://parcelsapp.com/en/tracking/${nr}`;
 }
 
-// ══════════════════════════════════════════════════════
+// ════════════════════════════════════════════════
 //  RENDER TABLE
-// ══════════════════════════════════════════════════════
+// ════════════════════════════════════════════════
 function renderTable() {
   const search = document.getElementById('searchInput').value.toLowerCase();
-  const filterStatus = document.getElementById('filterStatus').value;
-  const filterVendor = document.getElementById('filterVendor').value;
+  const fs = document.getElementById('filterStatus').value;
+  const fv = document.getElementById('filterVendor').value;
 
   let filtered = orders.filter(o => {
-    const text = [o.verkaeufer, o.order_nummer, o.tracking, o.atc, o.rechnungsnummer].join(' ').toLowerCase();
+    const text = [o.verkaeufer,o.order_nummer,o.atc,o.rechnungsnummer,(o.transporte||[]).map(t=>t.tracking_nummern?.join(' ')).join(' ')].join(' ').toLowerCase();
     if (search && !text.includes(search)) return false;
-    if (filterStatus === 'verzollt' && o.verzollt !== 'Ja') return false;
-    if (filterStatus === 'offen' && o.verzollt === 'Ja') return false;
-    if (filterVendor && o.verkaeufer !== filterVendor) return false;
+    if (fs==='verzollt'&&o.verzollt!=='Ja') return false;
+    if (fs==='offen'&&o.verzollt==='Ja') return false;
+    if (fv&&o.verkaeufer!==fv) return false;
     return true;
   });
 
   const tbody = document.getElementById('tableBody');
-
   if (!filtered.length) {
-    tbody.innerHTML = `<tr class="empty-row"><td colspan="11">${orders.length ? 'Keine Ergebnisse für diese Filterung' : 'Noch keine Bestellungen — Email oder PDF oben reinziehen'}</td></tr>`;
+    tbody.innerHTML = `<tr class="empty-row"><td colspan="10">${orders.length?'Keine Ergebnisse':'Noch keine Bestellungen — Email oder PDF oben reinziehen'}</td></tr>`;
     return;
   }
 
   tbody.innerHTML = filtered.map(o => {
-    const verzolltBadge = o.verzollt === 'Ja'
-      ? `<span class="badge badge-green">✓ Ja</span>`
-      : `<span class="badge badge-orange">Offen</span>`;
+    // Tracking block
+    const transporte = o.transporte||[];
+    const trackHtml = transporte.length ? transporte.map(t=>`
+      <div class="track-item">
+        <div class="track-carrier">${escH(t.transporteur||'Unbekannt')}</div>
+        ${(t.tracking_nummern||[]).map(nr=>`<a class="track-link" href="${trackingURL(nr,t.transporteur)}" target="_blank" rel="noopener">📦 ${nr.length>18?nr.slice(0,16)+'…':nr}</a>`).join('')}
+      </div>`).join('') : '<span style="color:var(--muted);font-size:12px">—</span>';
 
-    const trackHtml = trackingLink(o.tracking, o.transporteur);
+    // ATC
+    const atcHtml = o.atc ? o.atc.split(',').map(a=>`<span class="atc-cell" title="${escH(a.trim())}">${escH(a.trim())}</span>`).join('<br>') : '<span style="color:var(--muted)">—</span>';
+
+    // Belege
+    const belegs = o.belegs||{};
+    const belegHtml = `<div class="beleg-row">
+      <button class="beleg-btn ${belegs.bestellung?'has-file':'no-file'}" onclick="viewBeleg('${o.id}','bestellung')">${belegs.bestellung?'📦':'📦'} Bestellung</button>
+      <button class="beleg-btn ${belegs.steuer?'has-file':'no-file'}" onclick="viewBeleg('${o.id}','steuer')">${belegs.steuer?'📋':'📋'} Steuerbescheid</button>
+      <button class="beleg-btn ${belegs.rechnung?'has-file':'no-file'}" onclick="viewBeleg('${o.id}','rechnung')">${belegs.rechnung?'🚚':'🚚'} Frachtrechnung</button>
+    </div>`;
+
     const preis = o.preis_usd ? `$${parseFloat(o.preis_usd).toLocaleString('de-DE',{minimumFractionDigits:2,maximumFractionDigits:2})}` : '—';
-
-    const atcDisplay = o.atc
-      ? o.atc.split(',').map(a => `<span class="atc-cell" title="${a.trim()}">${a.trim()}</span>`).join('<br>')
-      : '<span style="color:var(--muted)">—</span>';
+    const verzBadge = o.verzollt==='Ja' ? `<span class="badge badge-green">✓ Ja</span>` : `<span class="badge badge-orange">Offen</span>`;
+    const versandBadge = `<span class="badge ${o.versand_usa==='Vorerst zu Axel'?'badge-blue':'badge-gray'}">${escH(o.versand_usa||'—')}</span>`;
 
     return `<tr>
-      <td><strong>${escHtml(o.verkaeufer || '—')}</strong></td>
-      <td class="cell-mono">${escHtml(o.order_nummer || '—')}</td>
-      <td>${escHtml(o.datum || '—')}</td>
+      <td><strong>${escH(o.verkaeufer||'—')}</strong></td>
+      <td class="cell-mono">${escH(o.order_nummer||'—')}</td>
+      <td>${escH(o.datum||'—')}</td>
       <td class="cell-usd">${preis}</td>
-      <td><span class="badge ${o.versand_usa === 'Vorerst zu Axel' ? 'badge-blue' : 'badge-gray'}">${escHtml(o.versand_usa || '—')}</span></td>
-      <td>${escHtml(o.transporteur || '—')}</td>
-      <td><div class="multi-track">${trackHtml}</div></td>
-      <td>${verzolltBadge}</td>
-      <td>${atcDisplay}</td>
-      <td class="cell-mono" style="font-size:11px">${escHtml(o.rechnungsnummer || '—')}</td>
+      <td>${versandBadge}</td>
+      <td><div class="track-block">${trackHtml}</div></td>
+      <td>${verzBadge}</td>
+      <td>${atcHtml}</td>
+      <td>${belegHtml}</td>
       <td>
         <div class="row-actions">
           <button class="btn btn-sm btn-outline" onclick="openEditModal('${o.id}')">✏️</button>
@@ -795,173 +882,322 @@ function renderTable() {
     </tr>`;
   }).join('');
 
-  // Update vendor filter
-  const vendors = [...new Set(orders.map(o => o.verkaeufer).filter(Boolean))].sort();
+  // Vendor filter
+  const vendors = [...new Set(orders.map(o=>o.verkaeufer).filter(Boolean))].sort();
   const vf = document.getElementById('filterVendor');
-  const current = vf.value;
-  vf.innerHTML = '<option value="">Alle Verkäufer</option>' + vendors.map(v => `<option value="${v}" ${v===current?'selected':''}>${v}</option>`).join('');
+  const cur = vf.value;
+  vf.innerHTML = '<option value="">Alle Verkäufer</option>' + vendors.map(v=>`<option value="${v}"${v===cur?' selected':''}>${v}</option>`).join('');
 }
 
-// ══════════════════════════════════════════════════════
-//  STATS
-// ══════════════════════════════════════════════════════
 function updateStats() {
-  const total = orders.length;
-  const cleared = orders.filter(o => o.verzollt === 'Ja').length;
-  const pending = total - cleared;
-  const totalUSD = orders.reduce((sum, o) => sum + (parseFloat(o.preis_usd) || 0), 0);
-
+  const total = orders.length, cleared = orders.filter(o=>o.verzollt==='Ja').length;
+  const totalUSD = orders.reduce((s,o)=>s+(parseFloat(o.preis_usd)||0),0);
   document.getElementById('statTotal').textContent = total;
-  document.getElementById('statPending').textContent = pending;
+  document.getElementById('statPending').textContent = total-cleared;
   document.getElementById('statCleared').textContent = cleared;
-  document.getElementById('statUSD').textContent = '$' + totalUSD.toLocaleString('de-DE',{minimumFractionDigits:0,maximumFractionDigits:0});
-  document.getElementById('totalBadge').textContent = total + (total===1?' Bestellung':' Bestellungen');
+  document.getElementById('statUSD').textContent = '$'+totalUSD.toLocaleString('de-DE',{minimumFractionDigits:0,maximumFractionDigits:0});
+  document.getElementById('totalBadge').textContent = total+(total===1?' Bestellung':' Bestellungen');
 }
 
-// ══════════════════════════════════════════════════════
-//  MODAL — ADD / EDIT
-// ══════════════════════════════════════════════════════
+// ════════════════════════════════════════════════
+//  BELEGE
+// ════════════════════════════════════════════════
+function handleBelegUpload(type) {
+  const input = document.getElementById('b_'+type);
+  if (!input.files?.length) return;
+  const file = input.files[0];
+  const reader = new FileReader();
+  reader.onload = e => {
+    if (!tempBelegs[type]) tempBelegs[type] = {};
+    tempBelegs[type] = { name: file.name, data: e.target.result };
+    document.getElementById('bf_'+type).textContent = file.name;
+    document.getElementById('bdel_'+type).style.display = 'inline-flex';
+  };
+  reader.readAsDataURL(file);
+}
+function clearBeleg(type) {
+  tempBelegs[type] = null;
+  document.getElementById('bf_'+type).textContent = '';
+  document.getElementById('bdel_'+type).style.display = 'none';
+  document.getElementById('b_'+type).value = '';
+}
+function viewBeleg(orderId, type) {
+  const o = orders.find(x=>x.id===orderId);
+  if (!o) return;
+  const beleg = o.belegs?.[type];
+  if (!beleg) { openEditModal(orderId); showToast('Noch kein Beleg vorhanden — hier hochladen', ''); return; }
+  document.getElementById('belegModalTitle').textContent = { bestellung:'📦 Bestellbestätigung', steuer:'📋 Steuerbescheid', rechnung:'🚚 Frachtrechnung' }[type]||'Beleg';
+  document.getElementById('belegFrame').src = beleg.data;
+  document.getElementById('belegModal').classList.add('active');
+}
+
+// ════════════════════════════════════════════════
+//  MODAL
+// ════════════════════════════════════════════════
 function openAddModal() {
-  editingId = null;
+  editingId = null; tempBelegs = {};
   document.getElementById('modalTitle').textContent = 'Neue Bestellung';
-  clearModalFields();
+  document.getElementById('m_verkaeufer').value=''; document.getElementById('m_ordernr').value='';
+  document.getElementById('m_datum').value=''; document.getElementById('m_preis').value='';
+  document.getElementById('m_versand').value='Direkt nach DE'; document.getElementById('m_verzollt').value='';
+  document.getElementById('m_atc').value=''; document.getElementById('m_rechnung_nr').value='';
+  ['bestellung','steuer','rechnung'].forEach(t=>{
+    document.getElementById('bf_'+t).textContent=''; document.getElementById('bdel_'+t).style.display='none';
+  });
+  trackEntryCount = 0; document.getElementById('trackEntries').innerHTML='';
+  addTrackEntry();
   document.getElementById('editModal').classList.add('active');
 }
 
 function openEditModal(id) {
-  editingId = id;
-  const o = orders.find(x => x.id === id);
-  if (!o) return;
+  editingId = id; tempBelegs = {};
+  const o = orders.find(x=>x.id===id); if(!o) return;
   document.getElementById('modalTitle').textContent = 'Bestellung bearbeiten';
-  document.getElementById('m_verkaeufer').value = o.verkaeufer || '';
-  document.getElementById('m_ordernr').value = o.order_nummer || '';
-  document.getElementById('m_datum').value = o.datum || '';
-  document.getElementById('m_preis').value = o.preis_usd || '';
-  document.getElementById('m_versand').value = o.versand_usa || 'Direkt nach DE';
-  document.getElementById('m_transporteur').value = o.transporteur || '';
-  document.getElementById('m_tracking').value = o.tracking || '';
-  document.getElementById('m_verzollt').value = o.verzollt || '';
-  document.getElementById('m_atc').value = o.atc || '';
-  document.getElementById('m_rechnung').value = o.rechnungsnummer || '';
+  document.getElementById('m_verkaeufer').value=o.verkaeufer||'';
+  document.getElementById('m_ordernr').value=o.order_nummer||'';
+  document.getElementById('m_datum').value=o.datum||'';
+  document.getElementById('m_preis').value=o.preis_usd||'';
+  document.getElementById('m_versand').value=o.versand_usa||'Direkt nach DE';
+  document.getElementById('m_verzollt').value=o.verzollt||'';
+  document.getElementById('m_atc').value=o.atc||'';
+  document.getElementById('m_rechnung_nr').value=o.rechnungsnummer||'';
+  // Belege
+  const belegs = o.belegs||{};
+  ['bestellung','steuer','rechnung'].forEach(t=>{
+    const b = belegs[t];
+    document.getElementById('bf_'+t).textContent = b?b.name:'';
+    document.getElementById('bdel_'+t).style.display = b?'inline-flex':'none';
+  });
+  // Trackings
+  trackEntryCount = 0; document.getElementById('trackEntries').innerHTML = '';
+  const transporte = o.transporte||[];
+  if (transporte.length) transporte.forEach(t=>addTrackEntry(t.transporteur, t.tracking_nummern?.join(', ')));
+  else addTrackEntry();
   document.getElementById('editModal').classList.add('active');
 }
 
-function closeModal() {
-  document.getElementById('editModal').classList.remove('active');
-  editingId = null;
-}
+function closeModal(id) { document.getElementById(id).classList.remove('active'); }
 
-function clearModalFields() {
-  ['m_verkaeufer','m_ordernr','m_datum','m_preis','m_transporteur','m_tracking','m_atc','m_rechnung'].forEach(id => {
-    document.getElementById(id).value = '';
-  });
-  document.getElementById('m_versand').value = 'Direkt nach DE';
-  document.getElementById('m_verzollt').value = '';
+function addTrackEntry(carrier='', nummern='') {
+  const i = ++trackEntryCount;
+  const div = document.createElement('div');
+  div.className = 'track-entry'; div.id = 'te_'+i;
+  div.innerHTML = `
+    <div class="track-entry-header">
+      <span class="track-num">Transport ${i}</span>
+      <button class="btn btn-sm" style="background:var(--red-bg);color:var(--red)" onclick="document.getElementById('te_${i}').remove()">✕</button>
+    </div>
+    <div class="field"><label>Transportunternehmen</label><input type="text" id="tc_${i}" value="${escH(carrier)}" placeholder="z.B. FedEx, DHL Express, UPS" /></div>
+    <div class="field"><label>Trackingnummer(n) — kommagetrennt</label><input type="text" id="tn_${i}" value="${escH(nummern)}" placeholder="z.B. 873263353010, 497192429" /></div>`;
+  document.getElementById('trackEntries').appendChild(div);
 }
 
 function saveModal() {
-  const o = {
-    verkaeufer: document.getElementById('m_verkaeufer').value.trim(),
-    order_nummer: document.getElementById('m_ordernr').value.trim(),
-    datum: document.getElementById('m_datum').value.trim(),
-    preis_usd: document.getElementById('m_preis').value.trim(),
-    versand_usa: document.getElementById('m_versand').value,
-    transporteur: document.getElementById('m_transporteur').value.trim(),
-    tracking: document.getElementById('m_tracking').value.trim(),
-    verzollt: document.getElementById('m_verzollt').value,
-    atc: document.getElementById('m_atc').value.trim(),
-    rechnungsnummer: document.getElementById('m_rechnung').value.trim(),
-  };
-
-  if (editingId) {
-    const idx = orders.findIndex(x => x.id === editingId);
-    if (idx >= 0) orders[idx] = { ...orders[idx], ...o };
-  } else {
-    orders.unshift({ id: genId(), created: new Date().toISOString(), ...o });
-  }
-
-  saveData();
-  renderTable();
-  updateStats();
-  closeModal();
-  showToast('Gespeichert ✓', 'success');
+  const o = editingId ? orders.find(x=>x.id===editingId) : { id:genId(), belegs:{}, created:new Date().toISOString() };
+  if (!o) return;
+  o.verkaeufer = document.getElementById('m_verkaeufer').value.trim();
+  o.order_nummer = document.getElementById('m_ordernr').value.trim();
+  o.datum = document.getElementById('m_datum').value.trim();
+  o.preis_usd = document.getElementById('m_preis').value.trim();
+  o.versand_usa = document.getElementById('m_versand').value;
+  o.verzollt = document.getElementById('m_verzollt').value;
+  o.atc = document.getElementById('m_atc').value.trim();
+  o.rechnungsnummer = document.getElementById('m_rechnung_nr').value.trim();
+  // Trackings
+  o.transporte = [];
+  document.querySelectorAll('[id^="te_"]').forEach(el => {
+    const i = el.id.split('_')[1];
+    const carrier = document.getElementById('tc_'+i)?.value.trim()||'';
+    const nrs = (document.getElementById('tn_'+i)?.value||'').split(',').map(n=>n.trim()).filter(Boolean);
+    if (carrier||nrs.length) o.transporte.push({ transporteur:carrier, tracking_nummern:nrs });
+  });
+  // Belegs
+  if (!o.belegs) o.belegs = {};
+  ['bestellung','steuer','rechnung'].forEach(t=>{ if(tempBelegs[t]) o.belegs[t]=tempBelegs[t]; });
+  if (!editingId) orders.unshift(o);
+  saveData(); renderTable(); updateStats();
+  closeModal('editModal'); showToast('Gespeichert ✓', 'success');
 }
 
-// ══════════════════════════════════════════════════════
+// ════════════════════════════════════════════════
 //  DELETE
-// ══════════════════════════════════════════════════════
+// ════════════════════════════════════════════════
 function deleteOrder(id) {
   if (!confirm('Bestellung löschen?')) return;
-  orders = orders.filter(o => o.id !== id);
-  saveData();
-  renderTable();
-  updateStats();
-  showToast('Gelöscht', '');
+  orders = orders.filter(o=>o.id!==id);
+  saveData(); renderTable(); updateStats();
 }
-
 function clearAllData() {
-  if (!confirm('ALLE Bestellungen löschen? Das kann nicht rückgängig gemacht werden.')) return;
-  orders = [];
-  saveData();
-  renderTable();
-  updateStats();
-  showToast('Alle Daten gelöscht', '');
+  if (!confirm('ALLE Bestellungen löschen?')) return;
+  orders=[]; saveData(); renderTable(); updateStats();
 }
 
-// ══════════════════════════════════════════════════════
-//  EXPORT CSV (Excel-kompatibel)
-// ══════════════════════════════════════════════════════
-function exportCSV() {
-  if (!orders.length) { showToast('Keine Daten zum Exportieren', 'error'); return; }
+// ════════════════════════════════════════════════
+//  EXPORT / SAVE
+// ════════════════════════════════════════════════
+function openSaveModal() { document.getElementById('saveModal').classList.add('active'); }
 
-  const headers = ['Verkäufer','Order-Nummer','Datum','Preis USD','Versand USA','Transporteur','Tracking','Verzollt','ATC-Nummer','Rechnungsnummer'];
-  const rows = orders.map(o => [
-    o.verkaeufer, o.order_nummer, o.datum, o.preis_usd,
-    o.versand_usa, o.transporteur, o.tracking,
+function doExport(type) {
+  const date = new Date().toISOString().slice(0,10);
+  if (type==='all') { doExport('xlsx'); setTimeout(()=>doExport('csv'),300); setTimeout(()=>doExport('json'),600); return; }
+  if (type==='json') {
+    const blob = new Blob([JSON.stringify(orders,null,2)],{type:'application/json'});
+    triggerDownload(URL.createObjectURL(blob), `Zoll_Backup_${date}.json`);
+    showToast('JSON-Backup gespeichert ✓', 'success'); backupDoneToday=true; return;
+  }
+  const cols = ['Verkäufer','Order-Nummer','Datum','Preis USD','Versand USA','Transporte & Tracking','Verzollt','ATC-Nummer','Rechnungsnummer'];
+  const rows = orders.map(o=>[
+    o.verkaeufer, o.order_nummer, o.datum, o.preis_usd, o.versand_usa,
+    (o.transporte||[]).map(t=>`${t.transporteur}: ${(t.tracking_nummern||[]).join(', ')}`).join(' | '),
     o.verzollt, o.atc, o.rechnungsnummer
-  ].map(v => `"${(v||'').replace(/"/g,'""')}"`));
-
-  const csv = '\uFEFF' + [headers.map(h=>`"${h}"`), ...rows].map(r=>r.join(';')).join('\r\n');
-  const blob = new Blob([csv], { type: 'text/csv;charset=utf-8' });
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement('a');
-  a.href = url;
-  a.download = `Zoll_Ersatzteile_${new Date().toISOString().slice(0,10)}.csv`;
-  a.click();
-  URL.revokeObjectURL(url);
-  showToast('CSV exportiert ✓', 'success');
+  ]);
+  if (type==='csv') {
+    const csv = '\uFEFF' + [cols,...rows].map(r=>r.map(v=>`"${(v||'').toString().replace(/"/g,'""')}"`).join(';')).join('\r\n');
+    triggerDownload(URL.createObjectURL(new Blob([csv],{type:'text/csv;charset=utf-8'})), `Zoll_Ersatzteile_${date}.csv`);
+    showToast('CSV gespeichert ✓', 'success'); backupDoneToday=true;
+  } else {
+    const wb = XLSX.utils.book_new();
+    const ws = XLSX.utils.aoa_to_sheet([cols,...rows]);
+    // Column widths
+    ws['!cols'] = [20,18,12,12,16,40,10,30,25].map(w=>({wch:w}));
+    XLSX.utils.book_append_sheet(wb, ws, 'Zoll Ersatzteile');
+    XLSX.writeFile(wb, `Zoll_Ersatzteile_${date}.xlsx`);
+    showToast('Excel-Datei gespeichert ✓', 'success'); backupDoneToday=true;
+  }
 }
 
-// ══════════════════════════════════════════════════════
+function triggerDownload(url, name) {
+  const a=document.createElement('a'); a.href=url; a.download=name; a.click(); URL.revokeObjectURL(url);
+}
+
+// ════════════════════════════════════════════════
+//  IMPORT
+// ════════════════════════════════════════════════
+async function importFile(input) {
+  const file = input.files?.[0]; if(!file) return;
+  try {
+    if (file.name.endsWith('.json')) {
+      const text = await file.text();
+      const imported = JSON.parse(text);
+      if (!Array.isArray(imported)) throw new Error('Ungültiges JSON-Format');
+      const count = imported.length;
+      imported.forEach(o=>{ if(!orders.find(x=>x.id===o.id)) orders.push(o); });
+      saveData(); renderTable(); updateStats();
+      showToast(`${count} Einträge importiert ✓`, 'success');
+    } else if (file.name.endsWith('.csv')) {
+      const text = await file.text();
+      importCSV(text);
+    } else if (file.name.endsWith('.xlsx')||file.name.endsWith('.xls')) {
+      showToast('Für Excel-Import bitte als CSV speichern (Datei → Speichern unter → CSV)', 'warning');
+    }
+  } catch(e) { showToast('Import-Fehler: '+e.message, 'error'); }
+  input.value='';
+}
+
+function importCSV(text) {
+  const rows = text.split('\n').map(r=>r.split(/[;,]/).map(c=>c.trim().replace(/^"|"$/g,'').replace(/""/g,'"')));
+  importRows(rows);
+}
+
+function importRows(rows) {
+  if (rows.length < 2) { showToast('Keine Daten gefunden', 'error'); return; }
+  const header = rows[0].map(h=>(h||'').toString().toLowerCase().trim());
+  // Map headers
+  const idx = {
+    verkaeufer: findCol(header,['verkäufer','verkaeufer','seller','vendor']),
+    order_nummer: findCol(header,['order','bestellnummer','order-nummer','order-nr','order_nummer']),
+    datum: findCol(header,['datum','date']),
+    preis_usd: findCol(header,['preis','usd','price','preis usd','preis in usd']),
+    versand_usa: findCol(header,['versand','versand usa','versand in usa']),
+    tracking: findCol(header,['tracking','trackingnummer','tracking-nummer']),
+    verzollt: findCol(header,['verzollt','zoll','customs']),
+    atc: findCol(header,['atc','atc-nummer','atx','atc nummer']),
+    rechnungsnummer: findCol(header,['rechnung','rechnungsnummer','invoice']),
+  };
+  let count=0;
+  rows.slice(1).forEach(row => {
+    if (!row.some(c=>c)) return;
+    const orderNr = idx.order_nummer>=0 ? row[idx.order_nummer]?.toString().trim()||'' : '';
+    if (orderNr && orders.find(o=>o.order_nummer===orderNr)) return; // skip duplicate
+    const trackStr = idx.tracking>=0 ? row[idx.tracking]?.toString().trim()||'' : '';
+    const transporte = trackStr ? [{ transporteur:'', tracking_nummern: trackStr.split(/[,|]/).map(t=>t.trim()).filter(Boolean) }] : [];
+    orders.push({
+      id:genId(), verkaeufer:idx.verkaeufer>=0?row[idx.verkaeufer]?.toString().trim()||'':'',
+      order_nummer:orderNr, datum:idx.datum>=0?row[idx.datum]?.toString().trim()||'':'',
+      preis_usd:idx.preis_usd>=0?row[idx.preis_usd]?.toString().trim()||'':'',
+      versand_usa:idx.versand_usa>=0?row[idx.versand_usa]?.toString().trim()||'Direkt nach DE':'Direkt nach DE',
+      transporte, verzollt:idx.verzollt>=0?row[idx.verzollt]?.toString().trim()||'':'',
+      atc:idx.atc>=0?row[idx.atc]?.toString().trim()||'':'',
+      rechnungsnummer:idx.rechnungsnummer>=0?row[idx.rechnungsnummer]?.toString().trim()||'':'',
+      belegs:{}, created:new Date().toISOString()
+    });
+    count++;
+  });
+  saveData(); renderTable(); updateStats();
+  showToast(`${count} Einträge importiert ✓`, 'success');
+}
+
+function findCol(headers, names) {
+  for (const n of names) { const i=headers.findIndex(h=>h.includes(n)); if(i>=0) return i; }
+  return -1;
+}
+
+// ════════════════════════════════════════════════
+//  LOG
+// ════════════════════════════════════════════════
+function addLog(type, main, details) {
+  logEntries.unshift({type,main,details,time:new Date().toLocaleTimeString('de-DE',{hour:'2-digit',minute:'2-digit',second:'2-digit'})});
+  if(logEntries.length>50) logEntries.pop();
+  renderLog();
+}
+function renderLog() {
+  const log = document.getElementById('matchLog'), body = document.getElementById('matchLogBody');
+  if(!logEntries.length){log.classList.remove('active');return;}
+  log.classList.add('active');
+  body.innerHTML = logEntries.map(e=>`
+    <div class="log-entry">
+      <div class="log-main">${escH(e.main)} <span style="margin-left:auto;font-size:11px;color:var(--muted)">${e.time}</span></div>
+      ${e.details.map(d=>`<div class="log-detail">${escH(d)}</div>`).join('')}
+    </div>`).join('');
+}
+function clearLog() { logEntries=[]; document.getElementById('matchLog').classList.remove('active'); }
+
+// ════════════════════════════════════════════════
+//  BACKUP REMINDER (15:00 + 17:00)
+// ════════════════════════════════════════════════
+function initBackupReminder() {
+  if ('Notification' in window) Notification.requestPermission().then(p=>{ notifPermission=p==='granted'; });
+  setInterval(checkBackupTime, 30000);
+}
+function checkBackupTime() {
+  if (backupDoneToday) return;
+  const now=new Date(), h=now.getHours(), m=now.getMinutes();
+  if ((h===15||h===17) && m===0) fireBackupReminder();
+}
+function fireBackupReminder() {
+  if (notifPermission) {
+    const n=new Notification('Zoll-Tracker Backup',{body:'Tägliche Erinnerung: Backup noch nicht gespeichert!',icon:'🔔'});
+    n.onclick=()=>{ openSaveModal(); n.close(); };
+  }
+  showToast('🔔 Backup-Erinnerung: Noch kein Backup heute!', 'warning');
+}
+window.addEventListener('beforeunload', e=>{ if(!backupDoneToday&&orders.length){ e.preventDefault(); e.returnValue='Kein Backup heute erstellt. Trotzdem schließen?'; }});
+document.getElementById('editModal').addEventListener('click',e=>{if(e.target===e.currentTarget)closeModal('editModal');});
+document.getElementById('saveModal').addEventListener('click',e=>{if(e.target===e.currentTarget)closeModal('saveModal');});
+document.getElementById('belegModal').addEventListener('click',e=>{if(e.target===e.currentTarget)closeModal('belegModal');});
+
+// ════════════════════════════════════════════════
 //  HELPERS
-// ══════════════════════════════════════════════════════
-function setProcessing(on, text) {
-  const bar = document.getElementById('processingBar');
-  bar.classList.toggle('active', on);
-  if (text) document.getElementById('processingText').textContent = text;
-}
+// ════════════════════════════════════════════════
+function genId(){return Date.now().toString(36)+Math.random().toString(36).slice(2,5)}
+function setProcessing(on,text){const b=document.getElementById('processingBar');b.classList.toggle('active',on);if(text)document.getElementById('processingText').textContent=text;}
+function showToast(msg,type=''){const t=document.getElementById('toast');t.textContent=msg;t.className='toast show'+(type?' '+type:'');clearTimeout(t._t);t._t=setTimeout(()=>t.classList.remove('show'),3500);}
+function escH(s){return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');}
 
-function showToast(msg, type='') {
-  const t = document.getElementById('toast');
-  t.textContent = msg;
-  t.className = 'toast show' + (type ? ' '+type : '');
-  setTimeout(() => t.classList.remove('show'), 3000);
-}
-
-function escHtml(s) {
-  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
-}
-
-// Close modal on overlay click
-document.getElementById('editModal').addEventListener('click', function(e) {
-  if (e.target === this) closeModal();
-});
-
-// ══════════════════════════════════════════════════════
+// ════════════════════════════════════════════════
 //  INIT
-// ══════════════════════════════════════════════════════
-renderTable();
-updateStats();
+// ════════════════════════════════════════════════
+renderTable(); updateStats(); initBackupReminder();
 </script>
 </body>
 </html>
