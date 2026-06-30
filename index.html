@@ -269,33 +269,33 @@ header{background:var(--text);color:#fff;padding:14px 24px;display:flex;align-it
 .table-scroll{overflow-x:auto}
 table{width:100%;border-collapse:collapse;min-width:1000px}
 thead tr{background:var(--surface2);border-bottom:2px solid var(--border)}
-th{padding:10px 12px;text-align:left;font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.5px;color:var(--muted);white-space:nowrap}
-td{padding:9px 12px;border-bottom:1px solid var(--border);vertical-align:top;font-size:13px}
+th{padding:8px 10px;text-align:left;font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:.4px;color:var(--muted);white-space:nowrap}
+td{padding:6px 10px;border-bottom:1px solid var(--border);vertical-align:middle;font-size:13px;line-height:1.3}
 tr:last-child td{border-bottom:none}
 tr:hover td{background:#FAFBFC}
 .empty-row td{text-align:center;padding:40px;color:var(--muted);vertical-align:middle}
 .cell-mono{font-family:var(--mono);font-size:12px}
 .cell-usd{font-family:var(--mono);font-size:13px;font-weight:600}
 /* Tracking block */
-.track-block{display:flex;flex-direction:column;gap:4px}
-.track-item{display:flex;flex-direction:column;gap:2px;padding:4px 6px;background:var(--surface2);border-radius:4px;border-left:2px solid var(--border2)}
-.track-carrier{font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.4px;color:var(--muted)}
-.track-link{display:inline-flex;align-items:center;gap:3px;color:var(--accent);text-decoration:none;font-family:var(--mono);font-size:11px;font-weight:600}
+.track-block{display:flex;flex-direction:column;gap:2px}
+.track-item{display:flex;align-items:center;gap:5px;font-size:11px}
+.track-carrier{color:var(--muted);min-width:auto}
+.track-link{display:inline-flex;align-items:center;gap:2px;color:var(--accent);text-decoration:none;font-family:var(--mono);font-size:11px}
 .track-link:hover{text-decoration:underline}
 /* Belege buttons */
-.beleg-row{display:flex;flex-direction:column;gap:3px}
-.beleg-btn{display:inline-flex;align-items:center;gap:4px;padding:3px 8px;border:none;border-radius:4px;font-size:11px;font-weight:600;cursor:pointer;transition:all .15s;text-align:left}
-.beleg-btn:hover{opacity:.8}
-.beleg-btn.has-file{background:#DBEAFE;color:#1E40AF}
-.beleg-btn.no-file{background:var(--surface2);color:var(--muted);border:1px dashed var(--border2)}
-.beleg-btn.no-file:hover{border-color:var(--accent);color:var(--accent)}
+.beleg-row{display:flex;gap:4px}
+.beleg-btn{display:inline-flex;align-items:center;justify-content:center;width:24px;height:24px;border:none;border-radius:4px;font-size:12px;cursor:pointer;transition:all .15s;padding:0}
+.beleg-btn:hover{opacity:.7}
+.beleg-btn.has-file{background:var(--accent-bg);color:var(--accent)}
+.beleg-btn.no-file{background:transparent;color:var(--border2);opacity:.5}
+.beleg-btn.no-file:hover{opacity:1;color:var(--muted)}
 /* Badges */
-.badge{display:inline-flex;align-items:center;gap:3px;padding:3px 8px;border-radius:99px;font-size:11px;font-weight:600;white-space:nowrap}
-.badge-green{background:var(--green-bg);color:var(--green)}
-.badge-orange{background:var(--orange-bg);color:var(--orange)}
-.badge-gray{background:var(--border);color:var(--muted)}
-.badge-blue{background:var(--accent-bg);color:var(--accent)}
-.atc-cell{font-family:var(--mono);font-size:11px;background:var(--surface2);padding:2px 5px;border-radius:3px;display:inline-block;max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;cursor:help}
+.badge{display:inline-flex;align-items:center;gap:3px;padding:2px 7px;border-radius:4px;font-size:11px;font-weight:600;white-space:nowrap}
+.badge-green{background:var(--surface2);color:var(--green);border:1px solid #C8E6D4}
+.badge-orange{background:var(--surface2);color:var(--orange);border:1px solid #EAD3BE}
+.badge-gray{background:var(--surface2);color:var(--muted);border:1px solid var(--border)}
+.badge-blue{background:var(--surface2);color:var(--accent);border:1px solid #C5D8F0}
+.atc-cell{font-family:var(--mono);font-size:11px;color:var(--text);display:inline-block;max-width:160px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;cursor:help}
 .row-actions{display:flex;gap:3px;opacity:0;transition:opacity .15s}
 tr:hover .row-actions{opacity:1}
 /* Modal */
@@ -1280,42 +1280,51 @@ function renderTable() {
   }
 
   tbody.innerHTML = filtered.map(o => {
-    // Tracking block
+    // Tracking — compact: first entry + count of additional
     const transporte = o.transporte||[];
-    const trackHtml = transporte.length ? transporte.map(t=>`
-      <div class="track-item">
-        <div class="track-carrier">${escH(t.transporteur||'Unbekannt')}</div>
-        ${(t.tracking_nummern||[]).map((nr,ni)=>`<a class="track-link" href="${trackingURL(nr,t.transporteur,(t.tracking_urls||[])[ni])}" target="_blank" rel="noopener">📦 ${nr.length>18?nr.slice(0,16)+'…':nr}</a>`).join('')}
-      </div>`).join('') : '<span style="color:var(--muted);font-size:12px">—</span>';
+    const allTrackFlat = [];
+    transporte.forEach(t => (t.tracking_nummern||[]).forEach((nr,ni) => allTrackFlat.push({nr, carrier:t.transporteur, url:(t.tracking_urls||[])[ni]})));
+    let trackHtml = '<span style="color:var(--muted);font-size:12px">—</span>';
+    if (allTrackFlat.length) {
+      const first = allTrackFlat[0];
+      const extra = allTrackFlat.length - 1;
+      trackHtml = `<div class="track-block">
+        <div class="track-item">
+          ${first.carrier?`<span class="track-carrier">${escH(first.carrier)}</span>`:''}
+          <a class="track-link" href="${trackingURL(first.nr,first.carrier,first.url)}" target="_blank" rel="noopener">${first.nr.length>14?first.nr.slice(0,12)+'…':first.nr}</a>
+        </div>
+        ${extra>0?`<span style="font-size:10px;color:var(--muted);cursor:pointer" onclick="openEditModal('${o.id}')">+${extra} weitere</span>`:''}
+      </div>`;
+    }
 
-    // ATC
-    const atcHtml = o.atc ? o.atc.split(',').map(a=>`<span class="atc-cell" title="${escH(a.trim())}">${escH(a.trim())}</span>`).join('<br>') : '<span style="color:var(--muted)">—</span>';
+    // ATC — compact: first + count
+    const atcList = o.atc ? o.atc.split(',').map(a=>a.trim()).filter(Boolean) : [];
+    let atcHtml = '<span style="color:var(--muted)">—</span>';
+    if (atcList.length) {
+      atcHtml = `<span class="atc-cell" title="${escH(atcList[0])}">${escH(atcList[0])}</span>` +
+        (atcList.length>1 ? `<span style="font-size:10px;color:var(--muted);margin-left:4px;cursor:pointer" onclick="openEditModal('${o.id}')">+${atcList.length-1}</span>` : '');
+    }
 
-    // Belege
+    // Belege — icon-only, compact
     const belegs = o.belegs||{};
-    const reNrs = (o.rechnungsnummer||'').split(',').map(r=>r.trim()).filter(Boolean);
-    const reHtml = reNrs.length ? reNrs.map(r=>`<div style="font-size:10px;font-family:var(--mono);color:var(--muted);padding:1px 0;white-space:nowrap">${escH(r)}</div>`).join('') : '';
-
     const belegHtml = `<div class="beleg-row">
-      <button class="beleg-btn ${belegs.bestellung?'has-file':'no-file'}" onclick="viewBeleg('${o.id}','bestellung')">📦 Bestellung</button>
-      <button class="beleg-btn ${belegs.steuer?'has-file':'no-file'}" onclick="viewBeleg('${o.id}','steuer')">📋 Steuerbescheid</button>
-      <button class="beleg-btn ${belegs.rechnung?'has-file':'no-file'}" onclick="viewBeleg('${o.id}','rechnung')">🚚 Frachtrechnung</button>
-      ${belegs.ordner?`<button class="beleg-btn has-file" onclick="viewBeleg('${o.id}','ordner')" title="${escH(belegs.ordner)}">📁 Ordner</button>`:''}
-      ${reHtml}
+      <button class="beleg-btn ${belegs.bestellung?'has-file':'no-file'}" onclick="viewBeleg('${o.id}','bestellung')" title="Bestellbestätigung">📦</button>
+      <button class="beleg-btn ${belegs.steuer?'has-file':'no-file'}" onclick="viewBeleg('${o.id}','steuer')" title="Steuerbescheid">📋</button>
+      <button class="beleg-btn ${belegs.rechnung?'has-file':'no-file'}" onclick="viewBeleg('${o.id}','rechnung')" title="Frachtrechnung">🚚</button>
     </div>`;
 
     const preis = o.preis_usd ? `$${parseFloat(o.preis_usd).toLocaleString('de-DE',{minimumFractionDigits:2,maximumFractionDigits:2})}` : '—';
-    const verzBadge = o.verzollt==='Ja' ? `<span class="badge badge-green">✓ Ja</span>` : `<span class="badge badge-orange">Offen</span>`;
-    const versandBadge = `<span class="badge ${o.versand_usa==='Vorerst zu Axel'?'badge-blue':'badge-gray'}">${escH(o.versand_usa||'—')}</span>`;
+    const verzBadge = o.verzollt==='Ja' ? `<span class="badge badge-green">✓</span>` : `<span class="badge badge-orange">Offen</span>`;
+    const versandBadge = o.versand_usa ? `<span class="badge ${o.versand_usa==='Vorerst zu Axel'?'badge-blue':'badge-gray'}">${escH(o.versand_usa)}</span>` : '<span style="color:var(--muted)">—</span>';
     const isDup = dupIds.has(o.id) && !manuallyDismissedDups.has(o.id);
 
     return `<tr data-id="${o.id}" ${isDup?'class="duplicate-row"':''} oncontextmenu="handleRowRightClick(event,'${o.id}')">
-      <td><strong>${escH(o.verkaeufer||'—')}</strong></td>
+      <td>${escH(o.verkaeufer||'—')}</td>
       <td class="cell-mono">${escH(o.order_nummer||'—')}</td>
       <td>${escH(o.datum||'—')}</td>
       <td class="cell-usd">${preis}</td>
       <td>${versandBadge}</td>
-      <td><div class="track-block">${trackHtml}</div></td>
+      <td>${trackHtml}</td>
       <td>${verzBadge}</td>
       <td>${atcHtml}</td>
       <td>${belegHtml}</td>
