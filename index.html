@@ -269,8 +269,8 @@ header{background:var(--text);color:#fff;padding:14px 24px;display:flex;align-it
 .table-scroll{overflow-x:auto}
 table{width:100%;border-collapse:collapse;min-width:1000px}
 thead tr{background:var(--surface2);border-bottom:2px solid var(--border)}
-th{padding:8px 10px;text-align:left;font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:.4px;color:var(--muted);white-space:nowrap}
-td{padding:6px 10px;border-bottom:1px solid var(--border);vertical-align:middle;font-size:13px;line-height:1.3}
+th{padding:10px 12px;text-align:left;font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.4px;color:var(--muted);white-space:nowrap}
+td{padding:12px 12px;border-bottom:1px solid var(--border);vertical-align:middle;font-size:13px;line-height:1.5}
 tr:last-child td{border-bottom:none}
 tr:hover td{background:#FAFBFC}
 .empty-row td{text-align:center;padding:40px;color:var(--muted);vertical-align:middle}
@@ -454,6 +454,10 @@ tr.duplicate-row:hover td{background:#fde8e8 !important}
       <input type="text" id="searchInput" placeholder="Alles durchsuchen…" oninput="renderTable()" />
     </div>
     <button class="btn btn-sm btn-outline" onclick="clearAllFilters()">✕ Filter zurücksetzen</button>
+    <label style="display:flex;align-items:center;gap:5px;font-size:12px;color:var(--text);cursor:pointer;padding:5px 10px;border:1px solid var(--border);border-radius:6px;background:var(--surface)">
+      <input type="checkbox" id="hideVerzollt" onchange="renderTable()" style="accent-color:var(--accent);cursor:pointer" />
+      Verzollte (✓ Ja) ausblenden
+    </label>
     <span id="filterCount" style="font-size:12px;color:var(--muted)"></span>
     <button class="btn btn-sm btn-danger" onclick="clearAllData()" style="margin-left:auto">🗑 Alle löschen</button>
   </div>
@@ -1217,6 +1221,7 @@ function clearColFilter(colKey) {
 function clearAllFilters() {
   Object.keys(colFilters).forEach(k=>delete colFilters[k]);
   document.getElementById('searchInput').value = '';
+  const hv = document.getElementById('hideVerzollt'); if (hv) hv.checked = false;
   updateFilterBtnStates();
   renderTable();
 }
@@ -1250,6 +1255,10 @@ function renderTable() {
   manuallyDismissedDups.forEach(id => { if(!dupIds.has(id)) manuallyDismissedDups.delete(id); });
 
   let filtered = orders.filter(o => {
+    // Hide verzollt toggle
+    const hideVerzollt = document.getElementById('hideVerzollt')?.checked;
+    if (hideVerzollt && o.verzollt === 'Ja') return false;
+
     // Global search
     const text = [o.verkaeufer,o.order_nummer,o.datum,o.atc,o.rechnungsnummer,
       (o.transporte||[]).map(t=>[t.transporteur,...(t.tracking_nummern||[])].join(' ')).join(' ')
